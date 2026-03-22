@@ -1,0 +1,18 @@
+# Core dependencies
+numpy>=1.20
+dask>=2021.0
+dask-ms>=0.2.0
+python-casacore>=3.4
+numba>=0.55
+psutil>=5.8
+tqdm>=4.60
+
+# Optional: GPU support
+# cuda-python>=11.0
+
+# Optional: Plotting
+bokeh>=3.0
+matplotlib>=3.5
+
+# Optional: C++ extension build
+pybind11>=2.10

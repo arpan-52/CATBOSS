@@ -1,0 +1,87 @@
+# ── Python ─────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+
+# ── Build / dist ────────────────────────────────────────────────────────────────
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+*.egg
+
+# ── C++ extensions (NIMKI) ──────────────────────────────────────────────────────
+src/catboss/nimki/*.so
+src/catboss/nimki/*.pyd
+src/catboss/nimki/build/
+src/catboss/nimki/temp*/
+
+# ── Virtual environments ─────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Testing ─────────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.test.ms/
+
+# ── Type checking / linting ──────────────────────────────────────────────────────
+.mypy_cache/
+.ruff_cache/
+
+# ── Jupyter ──────────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Data files ───────────────────────────────────────────────────────────────────
+*.ms/
+*.MS/
+*.fits
+*.FITS
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.pickle
+*.pkl
+
+# ── Plots / outputs ──────────────────────────────────────────────────────────────
+pooh_plots/
+nimki_plots/
+*_plots/
+*.png
+*.pdf
+*.svg
+
+# ── Logs ─────────────────────────────────────────────────────────────────────────
+*.log
+catboss_*.log
+logs/
+
+# ── IDEs ─────────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ── Numba cache ───────────────────────────────────────────────────────────────────
+__numba_cache__/
+numba_cache/
+
+# ── Docs build ────────────────────────────────────────────────────────────────────
+docs/_build/
+docs/api/
+
+# ── Secrets / local config ────────────────────────────────────────────────────────
+.env
+.env.local
+local_config.py

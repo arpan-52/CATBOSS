@@ -1,0 +1,98 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "pybind11>=2.10"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "catboss"
+version = "1.0.0"
+description = "CATBOSS - Comprehensive Automated Time-frequency Baseline Outlier and Signal Suppression"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Arpan Pal", email = "arpanpal@ncra.tifr.res.in"}
+]
+maintainers = [
+    {name = "Arpan Pal", email = "arpanpal@ncra.tifr.res.in"}
+]
+keywords = [
+    "radio-astronomy",
+    "rfi-mitigation",
+    "flagging",
+    "interferometry",
+    "measurement-set"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.20",
+    "dask>=2021.0",
+    "dask-ms>=0.2.0",
+    "python-casacore>=3.4",
+    "numba>=0.55",
+    "psutil>=5.8",
+    "tqdm>=4.60",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "numba>=0.55",
+    "cuda-python>=11.0",
+]
+plotting = [
+    "bokeh>=3.0",
+    "matplotlib>=3.5",
+]
+all = [
+    "catboss[gpu,plotting]",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=3.0",
+    "black>=22.0",
+    "flake8>=4.0",
+    "mypy>=0.950",
+]
+
+[project.scripts]
+catboss = "catboss.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/arpanpal/catboss"
+Documentation = "https://catboss.readthedocs.io"
+Repository = "https://github.com/arpanpal/catboss"
+Issues = "https://github.com/arpanpal/catboss/issues"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"catboss.nimki.cpp" = ["*.cpp", "*.h"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311']
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --cov=catboss"
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
