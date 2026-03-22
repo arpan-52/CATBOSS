@@ -1,12 +1,10 @@
 # CATBOSS — Radio Astronomy RFI Flagging Suite
 
-<p align="center">
-<img width="990" height="744" alt="CATBOSS" src="https://github.com/user-attachments/assets/5a4af262-44f2-4f21-b54d-907a1f5be0e6" />
-</p>
 
 <p align="center">
-<strong>Comprehensive Automated Time-frequency Baseline Outlier and Signal Suppression</strong>
+<img width="990" height="744" alt="CATBOSS" src="https://github.com/user-attachments/assets/a453d0c6-56ab-44bf-8665-5ca99c6de2d3" />
 </p>
+
 
 <p align="center">
 <em>Developed by Arpan Pal — National Centre for Radio Astrophysics, TIFR</em>
@@ -21,16 +19,16 @@
 
 ---
 
-Radio frequency interference is one of the most persistent headaches in modern radio astronomy. Every observation is contaminated — mobile phones, satellites, radar, even your laptop — and cleaning it out before imaging is absolutely non-negotiable. I built CATBOSS because I needed something fast, flexible, and honest about what it was doing to my data. Something that could run overnight on a full GMRT dataset without babysitting. Something smart enough to handle both time-frequency domain RFI *and* UV-domain outliers in a single pipeline.
+Radio frequency interference (RFI) is one of the most persistent headaches in modern radio astronomy. Every observation is contaminated—mobile phones, satellites, radar, even your laptop—and cleaning it out before imaging is absolutely non-negotiable. I built CATBOSS because I needed something fast, flexible, and honest about what it was doing to my data. It can process a full GMRT dataset in minutes without babysitting and is clever enough to handle both time–frequency domain RFI and UV-domain outliers in a single framework.
+
+Originally, I developed these as two separate codebases. Then I realized I have two cats—Pooh and Nimki. So this package now brings both of them together under the same hood, hunting down RFI like a pair of mischievous little predators. And yes—Pooh and Nimki are my real cats. This package is named in their honor.
 
 CATBOSS gives you two complementary flaggers:
 
 - **POOH** — *Parallelized Optimized Outlier Hunter* — works in the dynamic spectra domain, baseline by baseline, with GPU acceleration and multi-pass iterative flagging
 - **NIMKI** — *Non-linear Interference Modeling and Korrection Interface* — works in the UV plane, fits a Gabor basis to the visibility amplitude vs UV distance, and flags deviations from the model
 
-Oh — and Pooh and Nimki are my cats. They're excellent hunters and absolute troublemakers. I named this package after them. They deserve the credit.
-
----
+NIMKI can be thought of as a 1D version of [gridflag](https://github.com/skunkworks-ra/gridflag), but unlike gridflag, it performs explicit model fitting rather than relying solely on local statistics.
 
 ## Table of Contents
 
@@ -45,7 +43,6 @@ Oh — and Pooh and Nimki are my cats. They're excellent hunters and absolute tr
 - [Configuration Files](#configuration-files)
 - [Diagnostic Plots](#diagnostic-plots)
 - [Performance Tuning](#performance-tuning)
-- [Troubleshooting](#troubleshooting)
 - [Citation](#citation)
 - [License](#license)
 
@@ -65,7 +62,7 @@ Three flagging methods, each with its own strengths:
 
 **What makes it fast:**
 - GPU acceleration via CUDA / Numba — SumThreshold runs entirely on-device, batched across baselines
-- Numba JIT-compiled parallel CPU implementations for IQR and MAD (prange over baselines — no Python loops)
+- Numba JIT-compiled parallel CPU implementations for IQR and MAD
 - Memory-aware batching: probes real data dimensions, calculates batch size from actual free VRAM, pre-allocates GPU arrays once per field and reuses them
 - Async I/O prefetch with ThreadPoolExecutor while GPU is processing
 
@@ -73,8 +70,6 @@ Three flagging methods, each with its own strengths:
 - Iterative polynomial bandpass normalization with automatic bad channel detection before flagging
 - Multi-pass processing — passes are the outer loop, so each pass sees the full flag state from the previous one across the entire field, not just within a chunk
 - Time-frequency chunking for local statistics — `--timebin` and `--freqbin` define the boundaries for statistic calculation, respecting non-stationarity
-- Dummy antenna detection (reads only the first 10,000 rows — fast)
-- Existing flags always preserved and ORed with new ones, never overwritten
 
 ### NIMKI — UV-Domain Flagging
 
@@ -817,72 +812,6 @@ For maximum GPU utilization: let CATBOSS calculate the batch size itself. It pro
 - CUDA toolkit ≥ 11.0
 - `conda install numba cudatoolkit`
 
-### Memory Management
-
-If you hit memory issues on large datasets:
-
-```bash
-# Smaller I/O chunks
-catboss pooh data.ms --chunk-size 100000 --apply-flags
-
-# Use chunking to limit working set
-catboss pooh data.ms --timebin 50 --freqbin 64 --apply-flags
-
-# Reduce memory fraction
-catboss pooh data.ms --max-memory 0.6 --apply-flags
-```
-
-### Parallelism
-
-- **POOH + GPU**: parallelism happens at the CUDA kernel level — all baselines in a batch processed simultaneously on-device
-- **POOH + CPU**: Numba `prange` parallelizes across baselines in IQR/MAD stat calculations
-- **NIMKI**: `--ncpu` controls the multiprocessing pool for time chunks
-
-### Typical Performance (GMRT-like data, 30 antennas, 1024 channels)
-
-| Dataset | GPU Mode | CPU Mode | Speedup |
-|---------|----------|----------|---------|
-| 1M rows | ~30s | ~5 min | ~10× |
-| 10M rows | ~3 min | ~45 min | ~15× |
-| 100M rows | ~25 min | ~8 hrs | ~20× |
-
----
-
-## Troubleshooting
-
-| Problem | Fix |
-|---------|-----|
-| `ModuleNotFoundError: catboss` | Run `pip install -e .` from the repo root |
-| `CUDA not available` | CPU fallback activates automatically, no action needed |
-| `MemoryError` | Reduce `--chunk-size` or add `--timebin`/`--freqbin` |
-| `No baselines found` | Check MS: `taql 'select unique ANTENNA1,ANTENNA2 from data.ms'` |
-| GPU not detected after install | `conda install numba cudatoolkit`, then verify with `nvidia-smi` |
-| NIMKI C++ not found | Build: `cd src/catboss/nimki && python setup_cpp.py build_ext --inplace` |
-| Plots not generated | Install plotting extras: `pip install catboss[plotting]` |
-| Suspiciously high flag fraction | Try increasing `--sigma`, check bandpass normalization is working |
-| Suspiciously low flag fraction | Try decreasing `--sigma`, add more passes, check data column |
-
-### Quick Debugging
-
-```python
-# GPU status
-from catboss.utils import is_gpu_available, print_gpu_info
-print_gpu_info()
-
-# MS structure
-from daskms import xds_from_ms
-ds = xds_from_ms('data.ms')[0]
-print(f"Shape: {ds.DATA.shape}")
-print(f"Columns: {list(ds.data_vars)}")
-
-# Antenna table
-from casacore.tables import table
-with table('data.ms::ANTENNA', ack=False) as t:
-    print(f"Antennas: {t.nrows()}")
-    print(f"Names: {list(t.getcol('NAME'))}")
-```
-
----
 
 ## Citation
 
@@ -891,11 +820,10 @@ If CATBOSS contributed to your science, please cite:
 ```bibtex
 @software{catboss2025,
   author      = {Pal, Arpan},
-  title       = {CATBOSS: Comprehensive Automated Time-frequency Baseline
-                 Outlier and Signal Suppression},
+  title       = {CATBOSS},
   year        = {2025},
   institution = {National Centre for Radio Astrophysics, TIFR},
-  url         = {https://github.com/arpanpal/catboss}
+  url         = {https://github.com/arpan-52/CATBOSS}
 }
 ```
 
