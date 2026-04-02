@@ -228,15 +228,15 @@ class TestGPU:
     def test_batch_size_calculation(self):
         """Test batch size calculation."""
         from catboss.utils import calculate_batch_size
-        
-        batch_size = calculate_batch_size(
-            time_samples=1000,
-            freq_channels=256,
+
+        batch_size, _ = calculate_batch_size(
+            n_time=1000,
+            n_freq=256,
             n_corr=4,
-            gpu_usable_mem=4e9,  # 4 GB
-            system_usable_mem=16e9,  # 16 GB
+            gpu_free_mem=4e9,  # 4 GB
+            system_free_mem=16e9,  # 16 GB
         )
-        
+
         assert batch_size >= 1
         assert isinstance(batch_size, int)
 

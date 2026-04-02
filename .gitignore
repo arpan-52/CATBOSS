@@ -18,7 +18,7 @@ src/catboss/nimki/*.so
 src/catboss/nimki/*.pyd
 src/catboss/nimki/build/
 src/catboss/nimki/temp*/
-
+CLAUDE.MD
 # ── Virtual environments ─────────────────────────────────────────────────────────
 .venv/
 venv/

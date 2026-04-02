@@ -214,8 +214,12 @@ def calculate_robust_thresholds(
                     else:
                         thresholds[j] = thresholds[right_idx[0]]
         else:
-            # All flagged - use global
-            global_median = np.median(amp) * sigma_factor
+            # All flagged - use global (guard against NaN / zero)
+            finite_amp = amp[np.isfinite(amp) & (amp > 0)]
+            if len(finite_amp) > 0:
+                global_median = np.median(finite_amp) * sigma_factor
+            else:
+                global_median = 1e10  # Effectively flag nothing
             thresholds[:] = global_median
     
     return thresholds

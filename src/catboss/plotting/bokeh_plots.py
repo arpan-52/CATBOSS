@@ -23,6 +23,7 @@ import json
 import base64
 import io
 from typing import List, Dict, Any, Optional
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 # ── colour constants ────────────────────────────────────────────────────────────
 COLOR_EXISTING_HEX = '#FF4444'   # red    — existing flags (POOH)
@@ -60,6 +61,8 @@ def _render_spectra(
     existing_flags: np.ndarray,
     new_flags: np.ndarray,
     show_flags: bool = True,
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
 ):
     """Render a (n_time, n_freq) amplitude array as a PIL Image."""
     from PIL import Image
@@ -68,13 +71,15 @@ def _render_spectra(
     exist = np.asarray(existing_flags, dtype=bool)
     new   = np.asarray(new_flags, dtype=bool)
 
-    any_flag  = exist | new
-    unflagged = amp[~any_flag] if any_flag.any() else amp.ravel()
-    if len(unflagged) > 10:
-        vmin = float(np.percentile(unflagged, 2))
-        vmax = float(np.percentile(unflagged, 98))
-    else:
-        vmin, vmax = float(np.nanmin(amp)), float(np.nanmax(amp))
+    # Compute colour scale only if not pre-supplied
+    if vmin is None or vmax is None:
+        any_flag  = exist | new
+        unflagged = amp[~any_flag] if any_flag.any() else amp.ravel()
+        if len(unflagged) > 10:
+            vmin = float(np.percentile(unflagged, 2))
+            vmax = float(np.percentile(unflagged, 98))
+        else:
+            vmin, vmax = float(np.nanmin(amp)), float(np.nanmax(amp))
     if vmin == vmax:
         vmax = vmin + 1.0
 
@@ -109,9 +114,20 @@ def _encode_baseline(
     new_flags: np.ndarray,
 ):
     """Return (b64_raw, b64_flagged) inline-embeddable PNG strings."""
+    # Compute percentiles once, reuse for both renders
+    exist = np.asarray(existing_flags, dtype=bool)
+    new   = np.asarray(new_flags, dtype=bool)
+    any_flag  = exist | new
+    unflagged = amp[~any_flag] if any_flag.any() else amp.ravel()
+    if len(unflagged) > 10:
+        vmin = float(np.percentile(unflagged, 2))
+        vmax = float(np.percentile(unflagged, 98))
+    else:
+        vmin, vmax = float(np.nanmin(amp)), float(np.nanmax(amp))
+
     return (
-        _to_b64(_render_spectra(amp, existing_flags, new_flags, show_flags=False)),
-        _to_b64(_render_spectra(amp, existing_flags, new_flags, show_flags=True)),
+        _to_b64(_render_spectra(amp, existing_flags, new_flags, show_flags=False, vmin=vmin, vmax=vmax)),
+        _to_b64(_render_spectra(amp, existing_flags, new_flags, show_flags=True, vmin=vmin, vmax=vmax)),
     )
 
 
@@ -149,16 +165,14 @@ def create_field_viewer(
     meta   = []
     images = {}
 
+    # Build metadata (fast) and submit image rendering in parallel
+    uids = []
+    encode_args = []
     for bl_info in baseline_data:
         bl   = bl_info['baseline']
         corr = bl_info['corr_label']
         uid  = f"bl{bl[0]}-{bl[1]}_{corr}"
-
-        b64_raw, b64_flag = _encode_baseline(
-            bl_info['amp'],
-            bl_info['existing_flags'],
-            bl_info['new_flags'],
-        )
+        uids.append(uid)
 
         meta.append({
             'id':           uid,
@@ -167,6 +181,17 @@ def create_field_viewer(
             'pct_new':      f"{bl_info['pct_new']:.1f}",
             'pct_total':    f"{bl_info['pct_total']:.1f}",
         })
+        encode_args.append((bl_info['amp'], bl_info['existing_flags'], bl_info['new_flags']))
+
+    # Parallel image rendering — PIL releases GIL during encode/resize
+    n_workers = min(len(encode_args), os.cpu_count() or 4, 8)
+    if n_workers > 1:
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results = list(pool.map(lambda a: _encode_baseline(*a), encode_args))
+    else:
+        results = [_encode_baseline(*a) for a in encode_args]
+
+    for uid, (b64_raw, b64_flag) in zip(uids, results):
         images[uid] = {'raw': b64_raw, 'flagged': b64_flag}
 
     html = _generate_viewer_html(field_id, field_name, meta, images)

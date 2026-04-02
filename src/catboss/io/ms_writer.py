@@ -53,16 +53,18 @@ def apply_flags_to_ms(
         # Handle shape mismatch
         if orig_flags.shape != new_flags.shape:
             combined = orig_flags.copy()
-            
-            if len(new_flags.shape) == 2 and len(orig_flags.shape) == 3:
-                # 2D flags -> broadcast to 3D
-                for corr in range(orig_flags.shape[2]):
-                    min_t = min(orig_flags.shape[0], new_flags.shape[0])
-                    min_f = min(orig_flags.shape[1], new_flags.shape[1])
-                    combined[:min_t, :min_f, corr] = np.logical_or(
-                        orig_flags[:min_t, :min_f, corr],
-                        new_flags[:min_t, :min_f]
-                    )
+            min_t = min(orig_flags.shape[0], new_flags.shape[0])
+
+            if new_flags.ndim == 2 and orig_flags.ndim == 3:
+                # 2D flags -> broadcast to all correlations
+                min_f = min(orig_flags.shape[1], new_flags.shape[1])
+                new_3d = np.broadcast_to(
+                    new_flags[:min_t, :min_f, np.newaxis],
+                    (min_t, min_f, orig_flags.shape[2])
+                )
+                combined[:min_t, :min_f, :] = np.logical_or(
+                    orig_flags[:min_t, :min_f, :], new_3d
+                )
             else:
                 common = tuple(min(d1, d2) for d1, d2 in zip(orig_flags.shape, new_flags.shape))
                 slices = tuple(slice(0, d) for d in common)
@@ -214,32 +216,46 @@ def write_chunked_flags(
             
             for (t_start, t_end), flags in zip(time_chunks, chunk_flags):
                 query = f"{base_query} AND TIME>={t_start} AND TIME<{t_end}"
-                
+
                 with tb.query(query) as sub:
                     if sub.nrows() == 0:
                         continue
-                    
+
                     rows = sub.rownumbers()
-                    
-                    for i, row in enumerate(rows):
-                        if i >= flags.shape[0]:
-                            break
-                        
-                        orig_flag = tb.getcol('FLAG', startrow=row, nrow=1)
-                        
-                        # Combine flags
-                        if len(flags.shape) == 3:
-                            new_flag = np.logical_or(orig_flag[0], flags[i])
+                    n_use = min(len(rows), flags.shape[0])
+                    if n_use == 0:
+                        continue
+
+                    # Batch read: find contiguous runs for efficient I/O
+                    rows_arr = np.array(rows[:n_use])
+
+                    # Check if rows are contiguous
+                    if len(rows_arr) > 1 and np.all(np.diff(rows_arr) == 1):
+                        # Single batch read/write for contiguous rows
+                        orig_flags = tb.getcol('FLAG', startrow=int(rows_arr[0]), nrow=n_use)
+                        if flags.ndim == 3:
+                            combined = np.logical_or(orig_flags, flags[:n_use])
                         else:
-                            # 2D flags - broadcast
-                            new_flag = orig_flag[0].copy()
-                            for corr in range(orig_flag.shape[2]):
-                                new_flag[:, :, corr] = np.logical_or(
-                                    orig_flag[0, :, :, corr] if orig_flag.ndim == 4 else orig_flag[0, :, corr],
-                                    flags[i] if len(flags.shape) == 2 else flags[i, :, corr]
+                            # 2D flags - broadcast to all correlations
+                            combined = orig_flags.copy()
+                            for corr in range(orig_flags.shape[-1]):
+                                combined[:, :, corr] = np.logical_or(
+                                    orig_flags[:, :, corr], flags[:n_use]
                                 )
-                        
-                        tb.putcol('FLAG', new_flag.reshape(1, *new_flag.shape), startrow=row, nrow=1)
+                        tb.putcol('FLAG', combined, startrow=int(rows_arr[0]), nrow=n_use)
+                    else:
+                        # Non-contiguous: fall back to per-row I/O
+                        for i, row in enumerate(rows_arr):
+                            orig_flag = tb.getcol('FLAG', startrow=int(row), nrow=1)
+                            if flags.ndim == 3:
+                                new_flag = np.logical_or(orig_flag[0], flags[i])
+                            else:
+                                new_flag = orig_flag[0].copy()
+                                for corr in range(orig_flag.shape[-1]):
+                                    new_flag[:, corr] = np.logical_or(
+                                        orig_flag[0, :, corr], flags[i]
+                                    )
+                            tb.putcol('FLAG', new_flag.reshape(1, *new_flag.shape), startrow=int(row), nrow=1)
         
         return True
         

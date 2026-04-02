@@ -368,6 +368,11 @@ def read_data_column(
                     "Run calibration first or use different column."
                 )
             
+            if ds.DATA.shape != ds.MODEL_DATA.shape:
+                raise ValueError(
+                    f"DATA shape {ds.DATA.shape} != MODEL_DATA shape "
+                    f"{ds.MODEL_DATA.shape}. Cannot compute RESIDUAL_DATA."
+                )
             residual_data = ds.DATA - ds.MODEL_DATA
             ds_modified = ds.assign(DATA=residual_data)
             ds_modified = ds_modified.drop_vars('MODEL_DATA')
@@ -448,31 +453,45 @@ def read_baseline_data(
         chunks={"row": chunk_size},
     )
     
-    # Organize by baseline
-    baseline_data = defaultdict(lambda: {"data": [], "flags": []})
-    
+    # Organize by baseline — collect row indices first, then slice once
+    baselines_set = set(baselines)
+    baseline_rows = defaultdict(list)  # bl -> list of (data_row, chunk_idx)
+
+    all_chunks = []
     for ds in ds_list:
-        # Materialize
         ant1, ant2, data, flags = dask.compute(
             ds.ANTENNA1.data, ds.ANTENNA2.data, ds.DATA.data, ds.FLAG.data
         )
-        
-        # Group by baseline
+        chunk_idx = len(all_chunks)
+        all_chunks.append((data, flags))
+
         for i, (a1, a2) in enumerate(zip(ant1, ant2)):
             bl = (int(a1), int(a2))
-            if bl in baselines:
-                baseline_data[bl]["data"].append(data[i])
-                baseline_data[bl]["flags"].append(flags[i])
-    
-    # Stack arrays
+            if bl in baselines_set:
+                baseline_rows[bl].append((i, chunk_idx))
+
+    # Build result arrays with a single np.empty + direct copy
     result = {}
     for bl in baselines:
-        if bl in baseline_data and baseline_data[bl]["data"]:
-            result[bl] = {
-                "data": np.stack(baseline_data[bl]["data"], axis=0),
-                "flags": np.stack(baseline_data[bl]["flags"], axis=0),
-            }
-    
+        if bl not in baseline_rows:
+            continue
+        rows = baseline_rows[bl]
+        n_rows = len(rows)
+        if n_rows == 0:
+            continue
+
+        # Get shape from first row
+        first_i, first_ci = rows[0]
+        sample_data = all_chunks[first_ci][0][first_i]
+        data_out = np.empty((n_rows, *sample_data.shape), dtype=sample_data.dtype)
+        flags_out = np.empty((n_rows, *sample_data.shape), dtype=all_chunks[first_ci][1][first_i].dtype)
+
+        for out_idx, (row_i, ci) in enumerate(rows):
+            data_out[out_idx] = all_chunks[ci][0][row_i]
+            flags_out[out_idx] = all_chunks[ci][1][row_i]
+
+        result[bl] = {"data": data_out, "flags": flags_out}
+
     return result
 
 

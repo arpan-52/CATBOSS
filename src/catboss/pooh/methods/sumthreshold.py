@@ -268,14 +268,17 @@ class SumThresholdMethod(BaseFlaggingMethod):
     ):
         """CPU batch flagging with Numba parallel."""
         combi_arr = np.array(combinations, dtype=np.int32)
-        
-        # Ensure correct dtypes
-        amp = amp.astype(np.float32)
-        flags = flags.astype(np.uint8)
-        thresholds = thresholds.astype(np.float32)
-        
-        _sum_threshold_cpu_batch(amp, flags, thresholds, combi_arr, rho)
-        
+
+        # Ensure correct dtypes (copies so originals are not modified by astype)
+        amp_c = amp.astype(np.float32)
+        flags_work = flags.astype(np.uint8)
+        thresholds_c = thresholds.astype(np.float32)
+
+        _sum_threshold_cpu_batch(amp_c, flags_work, thresholds_c, combi_arr, rho)
+
+        # Copy results back to the caller's array (same pattern as IQR/MAD)
+        flags[:] = flags_work
+
         self.log(f"    SumThreshold CPU: {amp.shape[0]} baselines, {len(combinations)} windows")
     
     def _flag_batch_gpu(
