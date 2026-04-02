@@ -170,6 +170,15 @@ def process_batch_all_corrs(
     flags_flat = flags_batch.reshape(n_bl * n_corr, n_time, n_freq)
     thresh_flat = thresh_batch.reshape(n_bl * n_corr, n_freq)
 
+    # Pre-allocate contiguous chunk buffers (reused across all passes/chunks)
+    # Find max chunk dimensions to allocate once
+    max_t_chunk = max((t_end - t_start) for t_start, t_end in time_chunks)
+    max_f_chunk = max((f_end - f_start) for f_start, f_end in freq_chunks)
+    n_flat = n_bl * n_corr
+    amp_chunk_buf = np.empty((n_flat, max_t_chunk, max_f_chunk), dtype=np.float32)
+    flags_chunk_buf = np.empty((n_flat, max_t_chunk, max_f_chunk), dtype=np.uint8)
+    thresh_chunk_buf = np.empty((n_flat, max_f_chunk), dtype=np.float32)
+
     # Passes are the OUTER loop so each pass sees flags from the full previous pass
     for pass_idx, pass_config in enumerate(passes_config):
         method_name = pass_config.get('method', 'sumthreshold')
@@ -177,11 +186,18 @@ def process_batch_all_corrs(
 
         # timebin/freqbin define local stat regions — iterate over them
         for t_start, t_end in time_chunks:
+            t_len = t_end - t_start
             for f_start, f_end in freq_chunks:
-                # Contiguous copies needed for GPU memcpy; also isolates chunk writes
-                amp_chunk   = np.ascontiguousarray(amp_flat[:, t_start:t_end, f_start:f_end])
-                flags_chunk = np.ascontiguousarray(flags_flat[:, t_start:t_end, f_start:f_end])
-                thresh_chunk = np.ascontiguousarray(thresh_flat[:, f_start:f_end])
+                f_len = f_end - f_start
+
+                # Copy into pre-allocated contiguous buffers (avoids allocation)
+                amp_chunk = amp_chunk_buf[:, :t_len, :f_len]
+                flags_chunk = flags_chunk_buf[:, :t_len, :f_len]
+                thresh_chunk = thresh_chunk_buf[:, :f_len]
+
+                amp_chunk[:] = amp_flat[:, t_start:t_end, f_start:f_end]
+                flags_chunk[:] = flags_flat[:, t_start:t_end, f_start:f_end]
+                thresh_chunk[:] = thresh_flat[:, f_start:f_end]
 
                 method.flag_batch(amp_chunk, flags_chunk, thresh_chunk, gpu_arrays=gpu_arrays)
 

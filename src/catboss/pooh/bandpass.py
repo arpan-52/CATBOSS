@@ -165,8 +165,8 @@ def apply_bandpass_normalization_parallel(
             # Flag entire bad channel
             for i in range(n_time):
                 flags[i, j] = True
-        elif bandpass[j] > 0:
-            # Normalize good channel
+        elif bandpass[j] > 1e-10:
+            # Normalize good channel (epsilon guard against near-zero)
             for i in range(n_time):
                 if not flags[i, j]:
                     amp[i, j] = amp[i, j] / bandpass[j]
@@ -226,7 +226,7 @@ if is_gpu_available():
                 if bad_channels[j]:
                     for i in range(amp.shape[0]):
                         flags[i, j] = True
-                elif bandpass[j] > 0:
+                elif bandpass[j] > 1e-10:
                     for i in range(amp.shape[0]):
                         if not flags[i, j]:
                             amp[i, j] = amp[i, j] / bandpass[j]
