@@ -3,8 +3,8 @@ CATBOSS Plotting - Diagnostic viewers for POOH and NIMKI.
 
 POOH viewer:
 - Per-field self-contained HTML, clickable baseline sidebar
-- Left panel: raw dynamic spectra (inferno colourmap, PIL-rendered → base64 PNG embedded inline)
-- Right panel: same + flag overlay — existing=red (#FF4444), new=cyan (#00FFFF)
+- Left panel: raw dynamic spectra (cividis colourmap, PIL-rendered → base64 PNG embedded inline)
+- Right panel: same + flag overlay — existing=cyan (#00FFFF), new=red (#FF4444)
 - No external files, no disk-saved PNGs, no matplotlib figure overhead
 
 NIMKI viewer:
@@ -26,32 +26,33 @@ from typing import List, Dict, Any, Optional
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 # ── colour constants ────────────────────────────────────────────────────────────
-COLOR_EXISTING_HEX = '#FF4444'   # red    — existing flags (POOH)
-COLOR_NEW_HEX      = '#00FFFF'   # cyan   — new POOH flags
+COLOR_EXISTING_HEX = '#00FFFF'   # cyan    — existing flags (pre-CATBOSS)
+COLOR_NEW_HEX      = '#FF4444'   # red     — new POOH flags
 COLOR_NIMKI_HEX    = '#FF2D95'   # magenta — new NIMKI flags
 
-# ── inferno LUT (built once) ────────────────────────────────────────────────────
-_INFERNO_LUT: Optional[np.ndarray] = None
+# ── cividis LUT (built once) ────────────────────────────────────────────────────
+_CIVIDIS_LUT: Optional[np.ndarray] = None
 
 
-def _get_inferno_lut() -> np.ndarray:
-    global _INFERNO_LUT
-    if _INFERNO_LUT is not None:
-        return _INFERNO_LUT
+def _get_cividis_lut() -> np.ndarray:
+    global _CIVIDIS_LUT
+    if _CIVIDIS_LUT is not None:
+        return _CIVIDIS_LUT
     try:
         import matplotlib.cm as cm
-        lut = cm.get_cmap('inferno')(np.linspace(0.0, 1.0, 256))[:, :3]
-        _INFERNO_LUT = (lut * 255).astype(np.uint8)
+        lut = cm.get_cmap('cividis')(np.linspace(0.0, 1.0, 256))[:, :3]
+        _CIVIDIS_LUT = (lut * 255).astype(np.uint8)
     except Exception:
-        _INFERNO_LUT = np.zeros((256, 3), dtype=np.uint8)
+        # Fallback: dark blue-green → teal → yellow (approximate cividis)
+        _CIVIDIS_LUT = np.zeros((256, 3), dtype=np.uint8)
         for i in range(256):
             t = i / 255.0
-            _INFERNO_LUT[i] = (
-                int(min(255, t * 2 * 255)),
-                int(max(0, (t - 0.5) * 2 * 255)),
-                int(max(0, (1.0 - t * 2) * 200)),
+            _CIVIDIS_LUT[i] = (
+                int(min(255, t * 255)),
+                int(min(255, 70 + t * 160)),
+                int(max(0, 100 - t * 100)),
             )
-    return _INFERNO_LUT
+    return _CIVIDIS_LUT
 
 
 # ── spectrogram PIL renderer → inline base64 ───────────────────────────────────
@@ -67,7 +68,7 @@ def _render_spectra(
     """Render a (n_time, n_freq) amplitude array as a PIL Image."""
     from PIL import Image
 
-    lut   = _get_inferno_lut()
+    lut   = _get_cividis_lut()
     exist = np.asarray(existing_flags, dtype=bool)
     new   = np.asarray(new_flags, dtype=bool)
 
@@ -88,8 +89,8 @@ def _render_spectra(
     rgb     = lut[indices].copy()
 
     if show_flags:
-        rgb[exist] = (255,  68,  68)   # red
-        rgb[new]   = (  0, 255, 255)   # cyan
+        rgb[exist] = (  0, 255, 255)   # cyan  — pre-existing flags
+        rgb[new]   = (255,  68,  68)   # red   — new flags
 
     rgb = rgb[::-1]   # time increases upward
 
@@ -566,6 +567,23 @@ def create_nimki_viewer(
             outliers  = np.asarray(pd['outliers'],  dtype=bool)
             mad_sigma = float(pd['mad_sigma'])
             n_comp    = int(pd.get('n_components', 0))
+
+            # Downsample to keep HTML size manageable
+            MAX_POINTS = 50_000
+            n_total = len(uv)
+            if n_total > MAX_POINTS:
+                out_idx = np.where(outliers)[0]
+                good_idx = np.where(~outliers)[0]
+                # Keep all outliers, subsample the rest
+                n_good_sample = max(MAX_POINTS - len(out_idx), MAX_POINTS // 2)
+                if len(good_idx) > n_good_sample:
+                    good_idx = np.sort(np.random.default_rng(42).choice(
+                        good_idx, n_good_sample, replace=False))
+                keep = np.sort(np.concatenate([good_idx, out_idx]))
+                uv = uv[keep]
+                amp = amp[keep]
+                predicted = predicted[keep]
+                outliers = outliers[keep]
 
             good      = ~outliers
             sort_idx  = np.argsort(uv)

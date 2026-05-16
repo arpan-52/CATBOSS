@@ -121,82 +121,95 @@ _gpu_kernels_defined = False
 _sumthreshold_gpu_time_kernel = None
 _sumthreshold_gpu_freq_kernel = None
 
+_merge_flags_kernel = None
+
 if is_gpu_available():
     cuda = get_cuda()
-    
+
     if cuda is not None:
+        # Detection kernels write flag candidates into a scratch buffer
+        # (new_flags) while only READING the committed flag state. A separate
+        # merge kernel folds new_flags into flags between M iterations. This
+        # removes the read-modify-write race that occurred when adjacent
+        # threads overlapped on the same (t, f+k) cell.
+
         @cuda.jit
-        def _sumthreshold_gpu_time_3d(amp, flags, thresholds, M, scale):
+        def _sumthreshold_gpu_time_3d(amp, flags, new_flags, thresholds, M, scale):
             """
-            CUDA kernel for SumThreshold in time direction (3D batch).
-            
-            Grid: (n_baselines, n_time_blocks, n_freq_blocks)
-            Each thread handles one (bl, t, f) position.
+            SumThreshold along the frequency axis (window over channels),
+            one time sample per thread. Reads `flags`, writes into `new_flags`.
             """
             bl, t, f = cuda.grid(3)
-            
+
             n_bl, n_time, n_freq = amp.shape
-            
+
             if bl < n_bl and t < n_time and f < n_freq - M + 1:
-                # Calculate average threshold for window
                 avg_thresh = 0.0
                 for k in range(M):
                     avg_thresh += thresholds[bl, f + k]
                 avg_thresh = (avg_thresh / M) / scale
-                
-                # Sum unflagged samples in window
+
                 window_sum = 0.0
                 count = 0
                 for k in range(M):
                     if flags[bl, t, f + k] == 0:
                         window_sum += amp[bl, t, f + k]
                         count += 1
-                
+
                 min_unflagged = max(1, int(M * 0.3))
-                
+
                 if count >= min_unflagged:
                     avg_val = window_sum / count
                     if avg_val > avg_thresh:
-                        # Flag individual samples exceeding threshold
                         for k in range(M):
                             if flags[bl, t, f + k] == 0:
                                 sample_thresh = thresholds[bl, f + k] / scale
                                 if amp[bl, t, f + k] > sample_thresh:
-                                    flags[bl, t, f + k] = 1
+                                    new_flags[bl, t, f + k] = 1
 
         @cuda.jit
-        def _sumthreshold_gpu_freq_3d(amp, flags, thresholds, M, scale):
+        def _sumthreshold_gpu_freq_3d(amp, flags, new_flags, thresholds, M, scale):
             """
-            CUDA kernel for SumThreshold in frequency direction (3D batch).
+            SumThreshold along the time axis (window over time), one frequency
+            channel per thread. Reads `flags`, writes into `new_flags`.
             """
             bl, t, f = cuda.grid(3)
-            
+
             n_bl, n_time, n_freq = amp.shape
-            
+
             if bl < n_bl and t < n_time - M + 1 and f < n_freq:
                 thresh = thresholds[bl, f] / scale
-                
-                # Sum unflagged samples
+
                 window_sum = 0.0
                 count = 0
                 for k in range(M):
                     if flags[bl, t + k, f] == 0:
                         window_sum += amp[bl, t + k, f]
                         count += 1
-                
+
                 min_unflagged = max(1, int(M * 0.3))
-                
+
                 if count >= min_unflagged:
                     avg_val = window_sum / count
                     if avg_val > thresh:
                         for k in range(M):
                             if flags[bl, t + k, f] == 0:
                                 if amp[bl, t + k, f] > thresh:
-                                    flags[bl, t + k, f] = 1
-        
+                                    new_flags[bl, t + k, f] = 1
+
+        @cuda.jit
+        def _merge_flags_3d(flags, new_flags):
+            """OR new_flags into flags, then zero new_flags for next iteration."""
+            bl, t, f = cuda.grid(3)
+            if bl < flags.shape[0] and t < flags.shape[1] and f < flags.shape[2]:
+                if new_flags[bl, t, f] != 0:
+                    flags[bl, t, f] = 1
+                    new_flags[bl, t, f] = 0
+
         _gpu_kernels_defined = True
         _sumthreshold_gpu_time_kernel = _sumthreshold_gpu_time_3d
         _sumthreshold_gpu_freq_kernel = _sumthreshold_gpu_freq_3d
+        _merge_flags_kernel = _merge_flags_3d
 
 
 class SumThresholdMethod(BaseFlaggingMethod):
@@ -315,7 +328,15 @@ class SumThresholdMethod(BaseFlaggingMethod):
                 d_amp = cuda.to_device(amp_c)
                 d_flags = cuda.to_device(flags_c)
             d_thresh = cuda.to_device(np.ascontiguousarray(thresholds, dtype=np.float32))
-            
+
+            # Scratch buffer for new-flag candidates. Detection kernels write
+            # here (read-only on d_flags) so adjacent overlapping threads can't
+            # race on the committed flag state. The merge kernel folds it back
+            # into d_flags and zeroes it between passes.
+            d_new_flags = cuda.to_device(
+                np.zeros((n_bl, n_time, n_freq), dtype=np.uint8)
+            )
+
             # Calculate grid dimensions
             threads = (1, 16, 16)  # (baseline, time, freq)
             blocks = (
@@ -323,7 +344,7 @@ class SumThresholdMethod(BaseFlaggingMethod):
                 (n_time + threads[1] - 1) // threads[1],
                 (n_freq + threads[2] - 1) // threads[2]
             )
-            
+
             # Process each window size
             for M in combinations:
                 # Calculate scale factor
@@ -331,17 +352,20 @@ class SumThresholdMethod(BaseFlaggingMethod):
                     scale = rho ** np.log2(float(M))
                 else:
                     scale = 1.0
-                
-                # Time direction kernel
+
+                # Time direction kernel: write candidates to d_new_flags
                 _sumthreshold_gpu_time_kernel[blocks, threads](
-                    d_amp, d_flags, d_thresh, M, scale
+                    d_amp, d_flags, d_new_flags, d_thresh, M, scale
                 )
-                
+                # Merge candidates into d_flags before the freq kernel reads them
+                _merge_flags_kernel[blocks, threads](d_flags, d_new_flags)
+
                 # Frequency direction kernel
                 _sumthreshold_gpu_freq_kernel[blocks, threads](
-                    d_amp, d_flags, d_thresh, M, scale
+                    d_amp, d_flags, d_new_flags, d_thresh, M, scale
                 )
-            
+                _merge_flags_kernel[blocks, threads](d_flags, d_new_flags)
+
             # Single transfer back
             cuda.synchronize()
             d_flags.copy_to_host(flags)

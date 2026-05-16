@@ -126,24 +126,47 @@ def write_flags_batched(
                 row_flags[row][corr].add(ci)
     
     n_written = 0
-    
+
+    if not row_flags:
+        return 0
+
+    # Group the rows touched by this batch into contiguous runs and do one
+    # read+write per run instead of one per row. For NIMKI-style flagging
+    # this collapses thousands of getcol/putcol round-trips into a handful.
+    sorted_rows = sorted(row_flags.keys())
+
     with table(ms_file, readonly=False, ack=False) as tb:
-        for row, corr_data in row_flags.items():
+        run_start = sorted_rows[0]
+        run_end = run_start
+        def flush_run(start, end):
+            nonlocal n_written
+            nrow = end - start + 1
             try:
-                flags = tb.getcol('FLAG', startrow=row, nrow=1)
-                
-                for corr, chans in corr_data.items():
-                    for ci in chans:
-                        if ci < flags.shape[1]:
-                            flags[0, ci, corr] = True
-                            n_written += 1
-                
-                tb.putcol('FLAG', flags, startrow=row, nrow=1)
-                
+                flags = tb.getcol('FLAG', startrow=start, nrow=nrow)
+                for row in range(start, end + 1):
+                    corr_data = row_flags.get(row)
+                    if not corr_data:
+                        continue
+                    local = row - start
+                    for corr, chans in corr_data.items():
+                        for ci in chans:
+                            if ci < flags.shape[1] and corr < flags.shape[2]:
+                                flags[local, ci, corr] = True
+                                n_written += 1
+                tb.putcol('FLAG', flags, startrow=start, nrow=nrow)
             except Exception as e:
                 if logger:
-                    logger.warning(f"Failed to write row {row}: {e}")
-    
+                    logger.warning(f"Failed to write rows {start}-{end}: {e}")
+
+        for row in sorted_rows[1:]:
+            if row == run_end + 1:
+                run_end = row
+            else:
+                flush_run(run_start, run_end)
+                run_start = row
+                run_end = row
+        flush_run(run_start, run_end)
+
     return n_written
 
 

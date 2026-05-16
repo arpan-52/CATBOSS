@@ -35,18 +35,16 @@ def _init_gpu():
         if cuda.is_available():
             try:
                 CUDA_CONTEXT = cuda.current_context()
-                free, total = CUDA_CONTEXT.get_memory_info()
+                CUDA_CONTEXT.get_memory_info()
                 GPU_AVAILABLE = True
-                print(f"GPU: {total/1e9:.2f} GB VRAM available")
-            except Exception as e:
-                print(f"✗ GPU context test failed: {e} - using CPU only")
+            except Exception:
                 GPU_AVAILABLE = False
                 CUDA_CONTEXT = None
-        else:
-            print("✗ No GPU detected - will use CPU processing")
-            
+        # No else / no prints: load-time stdout chatter broke consumers that
+        # redirect or parse our output. Call print_gpu_info() explicitly to
+        # report status.
+
     except ImportError:
-        print("✗ Numba not installed - will use CPU processing")
         # Fallback
         def jit_fallback(*args, **kwargs):
             def decorator(func):
