@@ -209,24 +209,3 @@ def normalize_bandpass(
     apply_bandpass_normalization_parallel(amp, flags, bandpass, bad_channels)
     
     return amp, flags, bandpass, bad_channels, n_bad
-
-
-# GPU kernel for bandpass application (if available)
-if is_gpu_available():
-    from ..utils.gpu import get_cuda
-    cuda = get_cuda()
-    
-    if cuda is not None:
-        @cuda.jit
-        def bandpass_normalize_kernel(amp, flags, bandpass, bad_channels):
-            """CUDA kernel for bandpass normalization."""
-            j = cuda.grid(1)
-            
-            if j < amp.shape[1]:
-                if bad_channels[j]:
-                    for i in range(amp.shape[0]):
-                        flags[i, j] = True
-                elif bandpass[j] > 1e-10:
-                    for i in range(amp.shape[0]):
-                        if not flags[i, j]:
-                            amp[i, j] = amp[i, j] / bandpass[j]

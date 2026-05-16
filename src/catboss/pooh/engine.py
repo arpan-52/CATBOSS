@@ -23,9 +23,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 from ..io import (
     get_ms_info, get_unique_baselines, get_frequencies,
-    read_baseline_data, parse_selection, parse_baseline_selection,
-    write_field_flags, print_ms_summary,
+    read_baseline_data, parse_selection, parse_corr_selection,
+    parse_baseline_selection, write_field_flags, print_ms_summary,
 )
+from ..io.virtual_corr import compute_virtual_corr, get_virtual_corr_constituents
 from ..utils import (
     get_memory_info, calculate_batch_size, print_gpu_info,
     is_gpu_available, cuda_synchronize, free_gpu_memory,
@@ -38,7 +39,8 @@ from .methods import get_method
 
 def prepare_baseline_all_corrs(
     baseline_data: Dict[Tuple[int, int], Dict],
-    corr_indices: List[int],
+    corr_specs: List,
+    corr_labels: List[str],
     normalize: bool,
     poly_order: int,
     deviation_threshold: float,
@@ -46,64 +48,60 @@ def prepare_baseline_all_corrs(
     logger=None
 ) -> Dict[str, Any]:
     """
-    Prepare a batch of baselines with ALL correlations for GPU processing.
-    
-    Each correlation is processed independently but kept together per baseline.
-    
-    Args:
-        baseline_data: Dict mapping baseline -> {'data': complex, 'flags': bool}
-        corr_indices: Which correlations to process
-        normalize: Whether to apply bandpass normalization
-        poly_order: Polynomial order for bandpass
-        deviation_threshold: Bad channel detection threshold
-        sigma: Base sigma for threshold calculation
-        logger: Optional logger
-        
+    Prepare a batch of baselines with all selected correlations for GPU processing.
+
+    corr_specs is a mixed list of int (raw corr index) and str ('V', 'P' for
+    virtual correlations).  Virtual correlations are formed on the fly using
+    Jones algebra before being treated identically to real ones.
+
     Returns:
         Dict with:
-        - amp_batch: (n_bl × n_corr × n_time × n_freq), float32
-        - flags_batch: (n_bl × n_corr × n_time × n_freq), uint8
-        - existing_flags_batch: same shape, original flags
-        - thresh_batch: (n_bl × n_corr × n_freq), float32
-        - baselines: List of baseline tuples
-        - n_time, n_freq, n_corr: dimensions
+        - amp_batch:            (n_bl, n_corr, n_time, n_freq) float32
+        - flags_batch:          (n_bl, n_corr, n_time, n_freq) uint8
+        - existing_flags_batch: same shape, original (pre-run) flags
+        - thresh_batch:         (n_bl, n_corr, n_freq) float32
+        - baselines, n_time, n_freq, n_corr, corr_specs
         - total_bad_channels: int
     """
     baselines = list(baseline_data.keys())
     n_bl = len(baselines)
-    
+
     if n_bl == 0:
         return None
-    
-    # Get dimensions
+
     first_bl = baselines[0]
     first_data = baseline_data[first_bl]['data']
     n_time, n_freq, _ = first_data.shape
-    n_corr = len(corr_indices)
-    
-    # Output arrays: (n_bl, n_corr, n_time, n_freq)
-    amp_batch = np.zeros((n_bl, n_corr, n_time, n_freq), dtype=np.float32)
-    flags_batch = np.zeros((n_bl, n_corr, n_time, n_freq), dtype=np.uint8)
+    n_corr = len(corr_specs)
+
+    amp_batch            = np.zeros((n_bl, n_corr, n_time, n_freq), dtype=np.float32)
+    flags_batch          = np.zeros((n_bl, n_corr, n_time, n_freq), dtype=np.uint8)
     existing_flags_batch = np.zeros((n_bl, n_corr, n_time, n_freq), dtype=np.uint8)
-    thresh_batch = np.zeros((n_bl, n_corr, n_freq), dtype=np.float32)
-    
+    thresh_batch         = np.zeros((n_bl, n_corr, n_freq),         dtype=np.float32)
+
     total_bad_channels = 0
-    
+
     for bl_idx, bl in enumerate(baselines):
-        bl_data = baseline_data[bl]['data']
+        bl_data  = baseline_data[bl]['data']
         bl_flags = baseline_data[bl]['flags']
-        
-        for c_idx, corr_idx in enumerate(corr_indices):
-            data = bl_data[:, :, corr_idx]
-            flags = bl_flags[:, :, corr_idx].astype(bool)
-            
+
+        for c_idx, corr_spec in enumerate(corr_specs):
+            if isinstance(corr_spec, str):
+                # Virtual correlation (V or P): form from constituent raw corrs
+                virt_data, virt_flags, _ = compute_virtual_corr(
+                    bl_data, bl_flags, corr_labels, corr_spec
+                )
+                data  = virt_data
+                flags = virt_flags
+            else:
+                data  = bl_data[:, :, corr_spec]
+                flags = bl_flags[:, :, corr_spec].astype(bool)
+
             # Store existing flags BEFORE any processing
             existing_flags_batch[bl_idx, c_idx] = flags.astype(np.uint8)
-            
-            # Calculate amplitude
+
             amp = np.abs(data).astype(np.float32)
-            
-            # Bandpass normalization (respects existing flags)
+
             if normalize:
                 amp, flags, _, _, n_bad = normalize_bandpass(
                     amp, flags,
@@ -112,25 +110,24 @@ def prepare_baseline_all_corrs(
                     logger=None
                 )
                 total_bad_channels += n_bad
-            
-            # Calculate thresholds (respects flags)
+
             thresh = calculate_robust_thresholds(amp, flags, sigma)
-            
-            amp_batch[bl_idx, c_idx] = amp
+
+            amp_batch[bl_idx, c_idx]   = amp
             flags_batch[bl_idx, c_idx] = flags.astype(np.uint8)
             thresh_batch[bl_idx, c_idx] = thresh
-    
+
     return {
-        'amp_batch': amp_batch,
-        'flags_batch': flags_batch,
+        'amp_batch':            amp_batch,
+        'flags_batch':          flags_batch,
         'existing_flags_batch': existing_flags_batch,
-        'thresh_batch': thresh_batch,
-        'baselines': baselines,
-        'n_time': n_time,
-        'n_freq': n_freq,
-        'n_corr': n_corr,
-        'corr_indices': corr_indices,
-        'total_bad_channels': total_bad_channels,
+        'thresh_batch':         thresh_batch,
+        'baselines':            baselines,
+        'n_time':               n_time,
+        'n_freq':               n_freq,
+        'n_corr':               n_corr,
+        'corr_specs':           corr_specs,
+        'total_bad_channels':   total_bad_channels,
     }
 
 
@@ -275,7 +272,8 @@ def load_batch_async(
     baselines: List[Tuple[int, int]],
     datacolumn: str,
     chunk_size: int,
-    logger=None
+    logger=None,
+    scans: Optional[List[int]] = None,
 ) -> Dict:
     """Load batch of baselines from MS (for async prefetch)."""
     return read_baseline_data(
@@ -283,6 +281,7 @@ def load_batch_async(
         datacolumn=datacolumn,
         spw=None,
         chunk_size=chunk_size,
+        scans=scans,
         logger=None
     )
 
@@ -320,15 +319,40 @@ def hunt_ms(ms_file: str, options: Dict[str, Any]) -> Dict[str, Any]:
     if spw_ids is None:
         spw_ids = list(range(info['n_spw']))
     
-    corr_indices = parse_selection(options.get('corr'), list(range(info['n_corr'])))
-    if corr_indices is None:
-        corr_indices = list(range(info['n_corr']))
+    # Parse correlations — supports real indices AND virtual 'V'/'P'
+    raw_specs = parse_corr_selection(
+        options.get('corr'), info['corr_labels'], info['n_corr']
+    )
+    corr_specs = []
+    constituent_map: Dict[int, List[int]] = {}   # c_idx → raw corr indices
+    for spec in raw_specs:
+        if isinstance(spec, str):
+            try:
+                constituents = get_virtual_corr_constituents(spec, info['corr_labels'])
+                constituent_map[len(corr_specs)] = constituents
+                corr_specs.append(spec)
+            except ValueError as e:
+                if logger:
+                    logger.warning(f"  Skipping virtual corr '{spec}': {e}")
+        else:
+            corr_specs.append(spec)
+
+    propagate_flags = options.get('propagate_flags', False)
     
     baseline_filter = parse_baseline_selection(
         options.get('baseline'),
         info['valid_antennas']
     )
     exclude_autocorr = options.get('exclude_autocorr', False)
+
+    # Scan selection: comma-separated string or None → list[int] | None
+    _scan_raw = options.get('scan')
+    if isinstance(_scan_raw, str) and _scan_raw.strip():
+        scan_filter = [int(s.strip()) for s in _scan_raw.split(',') if s.strip()]
+    elif isinstance(_scan_raw, (list, tuple)):
+        scan_filter = [int(s) for s in _scan_raw]
+    else:
+        scan_filter = None
     
     # Build passes config
     passes = options.get('passes_config')
@@ -368,7 +392,7 @@ def hunt_ms(ms_file: str, options: Dict[str, Any]) -> Dict[str, Any]:
     n_baselines_est = n_ant * (n_ant - 1) // 2
     sample_n_time = max(100, info['n_rows'] // max(1, n_baselines_est * info['n_fields']))
     batch_size = calculate_batch_size_all_corrs(
-        sample_n_time, info['n_chan'], len(corr_indices),
+        sample_n_time, info['n_chan'], len(corr_specs),
         gpu_mem, sys_mem, use_gpu, logger
     )
     
@@ -383,11 +407,12 @@ def hunt_ms(ms_file: str, options: Dict[str, Any]) -> Dict[str, Any]:
     if logger:
         logger.info("  PROCESSING CONFIGURATION")
         logger.info(f"  Fields: {[info['field_names'][i] for i in field_ids]}")
-        logger.info(f"  Correlations: {[info['corr_labels'][i] for i in corr_indices]} (all processed independently)")
+        corr_display = [s if isinstance(s, str) else info['corr_labels'][s] for s in corr_specs]
+        logger.info(f"  Correlations: {corr_display} (all processed independently)")
         logger.info(f"  Passes: {len(passes)}")
         for i, p in enumerate(passes):
             logger.info(f"    Pass {i+1}: {p.get('method')} - {p}")
-        logger.info(f"  Batch size: {batch_size} baselines × {len(corr_indices)} corrs")
+        logger.info(f"  Batch size: {batch_size} baselines × {len(corr_specs)} corrs")
         logger.info(f"  Mode: {'GPU' if use_gpu else 'CPU'}")
         logger.info(f"  Bandpass normalization: {normalize}")
         logger.info(f"  Apply flags: {apply_flags}")
@@ -449,7 +474,8 @@ def hunt_ms(ms_file: str, options: Dict[str, Any]) -> Dict[str, Any]:
                 probe = read_baseline_data(
                     ms_file, field_id, baselines[:1],
                     datacolumn=options.get('datacolumn', 'DATA'),
-                    spw=None, chunk_size=50000, logger=None
+                    spw=None, chunk_size=50000,
+                    scans=scan_filter, logger=None
                 )
                 if probe:
                     probe_key = list(probe.keys())[0]
@@ -457,7 +483,7 @@ def hunt_ms(ms_file: str, options: Dict[str, Any]) -> Dict[str, Any]:
                     del probe
                     gpu_mem_now, sys_mem_now = get_memory_info()
                     batch_size = calculate_batch_size_all_corrs(
-                        real_n_time, info['n_chan'], len(corr_indices),
+                        real_n_time, info['n_chan'], len(corr_specs),
                         gpu_mem_now, sys_mem_now, use_gpu, logger
                     )
                     if logger:
@@ -466,13 +492,21 @@ def hunt_ms(ms_file: str, options: Dict[str, Any]) -> Dict[str, Any]:
                 if logger:
                     logger.warning(f"  Probe read failed ({e}), using estimated batch_size={batch_size}")
 
-        # Pre-allocate GPU arrays once for this field — reused across all batches
+        # Pre-allocate GPU arrays once for this field — reused across all batches.
+        # Drop any allocations from the previous field FIRST so the peak GPU
+        # footprint stays at one field's worth, not two. Without this the old
+        # d_amp_pre/d_flags_pre stay live through the new cuda.device_array
+        # calls and double the required VRAM for a few hundred milliseconds —
+        # enough to OOM on a second field when the first just fit.
         gpu_arrays = None
+        gc.collect()
+        cuda_synchronize()
+        free_gpu_memory()
         if use_gpu and real_n_time is not None:
             _cuda = get_cuda()
             if _cuda is not None:
                 try:
-                    n_flat = batch_size * len(corr_indices)
+                    n_flat = batch_size * len(corr_specs)
                     d_amp_pre = _cuda.device_array(
                         (n_flat, real_n_time, info['n_chan']), dtype=np.float32
                     )
@@ -502,7 +536,8 @@ def hunt_ms(ms_file: str, options: Dict[str, Any]) -> Dict[str, Any]:
         prefetch_future = executor.submit(
             load_batch_async, ms_file, field_id, batches[0],
             options.get('datacolumn', 'DATA'),
-            options.get('chunk_size', 200000), None
+            options.get('chunk_size', 200000), None,
+            scan_filter
         )
         
         for batch_idx, batch_baselines in enumerate(batches):
@@ -522,13 +557,14 @@ def hunt_ms(ms_file: str, options: Dict[str, Any]) -> Dict[str, Any]:
                 prefetch_future = executor.submit(
                     load_batch_async, ms_file, field_id, batches[batch_idx + 1],
                     options.get('datacolumn', 'DATA'),
-                    options.get('chunk_size', 200000), None
+                    options.get('chunk_size', 200000), None,
+                    scan_filter
                 )
             
             # Prepare all correlations
             prep_start = time.time()
             prep_data = prepare_baseline_all_corrs(
-                baseline_data, corr_indices,
+                baseline_data, corr_specs, info['corr_labels'],
                 normalize=normalize,
                 poly_order=poly_order,
                 deviation_threshold=deviation_threshold,
@@ -582,32 +618,45 @@ def hunt_ms(ms_file: str, options: Dict[str, Any]) -> Dict[str, Any]:
             # Collect plot data
             if make_plots:
                 for bl_idx, bl in enumerate(bl_order):
-                    for c_idx, corr_idx in enumerate(corr_indices):
+                    for c_idx, corr_spec in enumerate(corr_specs):
+                        corr_label = (corr_spec if isinstance(corr_spec, str)
+                                      else info['corr_labels'][corr_spec])
                         existing = prep_data['existing_flags_batch'][bl_idx, c_idx]
-                        final = flags_result[bl_idx, c_idx]
+                        final    = flags_result[bl_idx, c_idx]
                         new_only = (final > 0) & ~(existing > 0)
-                        
+
                         pct_exist = 100 * np.sum(existing > 0) / existing.size
-                        pct_new = 100 * np.sum(new_only) / new_only.size
-                        pct_total = 100 * np.sum(final > 0) / final.size
-                        
+                        pct_new   = 100 * np.sum(new_only)    / new_only.size
+                        pct_total = 100 * np.sum(final > 0)   / final.size
+
                         plot_data.append({
-                            'baseline': bl,
-                            'corr_label': info['corr_labels'][corr_idx],
-                            'amp': prep_data['amp_batch'][bl_idx, c_idx],
+                            'baseline':       bl,
+                            'corr_label':     corr_label,
+                            'amp':            prep_data['amp_batch'][bl_idx, c_idx],
                             'existing_flags': existing,
-                            'new_flags': new_only.astype(np.uint8),
-                            'pct_existing': pct_exist,
-                            'pct_new': pct_new,
-                            'pct_total': pct_total,
+                            'new_flags':      new_only.astype(np.uint8),
+                            'pct_existing':   pct_exist,
+                            'pct_new':        pct_new,
+                            'pct_total':      pct_total,
                         })
             
-            # Store flags for writing (combine all corrs back)
+            # Store flags for writing (map processed corrs back to MS corr axis)
             if apply_flags:
+                all_raw_idxs = list(range(info['n_corr']))
                 for bl_idx, bl in enumerate(bl_order):
                     full_flags = np.zeros((n_time, n_freq, info['n_corr']), dtype=bool)
-                    for c_idx, corr_idx in enumerate(corr_indices):
-                        full_flags[:, :, corr_idx] = flags_result[bl_idx, c_idx] > 0
+                    for c_idx, corr_spec in enumerate(corr_specs):
+                        flag_slice = flags_result[bl_idx, c_idx] > 0
+                        if propagate_flags:
+                            # Spread to every correlation
+                            target_idxs = all_raw_idxs
+                        elif isinstance(corr_spec, str):
+                            # Virtual corr: write back to its constituent raw corrs only
+                            target_idxs = constituent_map.get(c_idx, [])
+                        else:
+                            target_idxs = [corr_spec]
+                        for raw_idx in target_idxs:
+                            full_flags[:, :, raw_idx] |= flag_slice
                     field_flags[bl] = full_flags
             
             # Cleanup

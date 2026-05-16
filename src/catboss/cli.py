@@ -184,11 +184,21 @@ Multi-pass: Use comma-separated values for per-pass parameters.
     )
     sel_group.add_argument(
         '--corr', type=str, default=None,
-        help='Correlation indices, comma-separated (default: all)'
+        help=(
+            'Correlations to process: integer indices and/or virtual names. '
+            'Integer indices select raw MS correlations (0-based). '
+            'V = Stokes V [(RR-LL)/2 or -i(XY-YX)/2]. '
+            'P = linear polarization [(RL+LR)/2 or (XY+YX)/2]. '
+            'Examples: --corr 0,3  --corr V  --corr P  --corr 0,V  (default: all)'
+        )
     )
     sel_group.add_argument(
         '--baseline', type=str, default=None,
         help='Baselines as "0-1,0-2,1-2" (default: all)'
+    )
+    sel_group.add_argument(
+        '--scan', type=str, default=None,
+        help='Scan numbers, comma-separated (default: all)'
     )
     sel_group.add_argument(
         '--exclude-autocorr', action='store_true',
@@ -332,7 +342,11 @@ source structure (disks, rings, double sources, etc.)
         '--corr', type=str, default=None,
         help='Correlation indices, comma-separated (default: all)'
     )
-    
+    sel_group.add_argument(
+        '--scan', type=str, default=None,
+        help='Scan numbers, comma-separated (default: all)'
+    )
+
     # Time chunking
     chunk_group = nimki.add_argument_group('Time Chunking')
     chunk_group.add_argument(
@@ -416,6 +430,7 @@ def run_pooh(args) -> int:
         'spw': args.spw,
         'corr': args.corr,
         'baseline': args.baseline,
+        'scan': args.scan,
         'exclude_autocorr': args.exclude_autocorr,
         'timebin': args.timebin,
         'freqbin': args.freqbin,
@@ -486,6 +501,7 @@ def run_nimki(args) -> int:
         'field': args.field,
         'spw': args.spw,
         'corr': args.corr,
+        'scan': args.scan,
         'timebin': args.timebin,
         'apply_flags': args.apply_flags and not args.dry_run,
         'dry_run': args.dry_run,

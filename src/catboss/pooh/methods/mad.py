@@ -103,7 +103,10 @@ def _calculate_mad_parallel(
             medians_out[bl, f] = med
 
             if count < 3:
-                mads_out[bl, f] = med * 0.1
+                # Too few samples to estimate MAD reliably. Leave the
+                # pre-initialised sentinel (1e10) so the threshold is
+                # effectively infinite — under-sampled channels flag nothing
+                # rather than collapsing the threshold to the median.
                 continue
 
             # MAD: median of absolute deviations
@@ -117,7 +120,13 @@ def _calculate_mad_parallel(
             else:
                 mad = devs[count // 2]
 
-            mads_out[bl, f] = mad if mad > 1e-10 else 1e-10
+            # mad == 0 means every unflagged sample equals the median
+            # (identical-valued channel). Setting mad to 1e-10 would
+            # collapse the threshold to median + epsilon and flag every
+            # sample that is even fractionally above the median. Keep the
+            # 1e10 sentinel so such channels flag nothing.
+            if mad > 1e-10:
+                mads_out[bl, f] = mad
 
 
 def calculate_mad_batch(

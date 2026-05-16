@@ -85,15 +85,12 @@ def _calculate_quartiles_single(amp: np.ndarray, flags: np.ndarray) -> tuple:
             q1[f] = valid_arr[n // 4]
             q3[f] = valid_arr[(3 * n) // 4]
         else:
-            # Not enough samples, use median ± some range
-            if len(valid) > 0:
-                valid_arr = np.array(valid)
-                med = np.median(valid_arr)
-                q1[f] = med * 0.5
-                q3[f] = med * 1.5
-            else:
-                q1[f] = 0.0
-                q3[f] = 1e10  # Will flag nothing
+            # Not enough samples to estimate quartiles — use a non-flagging
+            # sentinel (q3 = 1e10) so under-sampled channels flag nothing.
+            # The old median*0.5/median*1.5 fallback collapsed to zero when
+            # med≈0 and flagged every non-zero sample.
+            q1[f] = 0.0
+            q3[f] = 1e10
     
     return q1, q3
 
@@ -142,11 +139,9 @@ def _calculate_quartiles_parallel(
             if count >= 4:
                 q1_out[bl, f] = valid[count // 4]
                 q3_out[bl, f] = valid[(3 * count) // 4]
-            else:
-                # Too few samples — use median ± half range as fallback
-                med = valid[count // 2]
-                q1_out[bl, f] = med * 0.5
-                q3_out[bl, f] = med * 1.5
+            # else: leave pre-initialised sentinel (q1=0, q3=1e10). The old
+            # med*0.5/med*1.5 fallback collapsed when med≈0 and flagged
+            # every non-zero sample in under-sampled channels.
 
 
 def calculate_quartiles_batch(

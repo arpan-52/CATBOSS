@@ -286,6 +286,54 @@ def parse_selection(
         return None
 
 
+def parse_corr_selection(
+    selection_str,
+    corr_labels: List[str],
+    n_corr: int,
+) -> List:
+    """
+    Parse a correlation selection string that may include real indices or
+    virtual correlation names.
+
+    Supported tokens (comma-separated, case-insensitive):
+      - Integer indices : "0,1,2,3"
+      - Virtual corrs   : "V" (Stokes V), "P" (linear polarization)
+      - Mixed           : "0,V"  or  "V,P"
+
+    Passing None / '' / 'all' returns all real corr indices [0 .. n_corr-1].
+
+    Returns:
+        List[Union[int, str]] — ints for raw corrs, 'V'/'P' for virtuals.
+        Duplicates are silently dropped; out-of-range integers are ignored.
+    """
+    VIRTUAL_NAMES = {'V', 'P'}
+
+    if selection_str is None or selection_str.strip().lower() in ('', 'all'):
+        return list(range(n_corr))
+
+    result = []
+    seen: set = set()
+    for token in selection_str.split(','):
+        token = token.strip()
+        if not token:
+            continue
+        upper = token.upper()
+        if upper in VIRTUAL_NAMES:
+            if upper not in seen:
+                result.append(upper)
+                seen.add(upper)
+        else:
+            try:
+                idx = int(token)
+                if 0 <= idx < n_corr and idx not in seen:
+                    result.append(idx)
+                    seen.add(idx)
+            except ValueError:
+                pass
+
+    return result if result else list(range(n_corr))
+
+
 def parse_baseline_selection(
     baseline_str: Optional[str],
     valid_antennas: Optional[List[int]] = None
@@ -418,6 +466,7 @@ def read_baseline_data(
     datacolumn: str = "DATA",
     spw: Optional[int] = None,
     chunk_size: int = 200000,
+    scans: Optional[List[int]] = None,
     logger=None
 ) -> Dict[Tuple[int, int], Dict[str, np.ndarray]]:
     """
@@ -443,7 +492,11 @@ def read_baseline_data(
     
     if spw is not None:
         taql_where += f" AND DATA_DESC_ID={spw}"
-    
+
+    if scans:
+        scan_clause = ",".join(str(int(s)) for s in scans)
+        taql_where += f" AND SCAN_NUMBER IN [{scan_clause}]"
+
     # Read
     ds_list = read_data_column(
         ms_file,

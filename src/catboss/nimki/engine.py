@@ -27,48 +27,108 @@ from .core_functions import (
 )
 
 
-def read_chunk(
-    ms_file: str,
-    field_id: int,
-    t_start: float,
-    t_end: float,
-    datacolumn: str,
-    spws: List[int]
-) -> Optional[Dict[str, np.ndarray]]:
-    """Read one time chunk from MS."""
+def _build_base_query(field_id: int, spws: List[int],
+                      scan_ids: Optional[List[int]] = None) -> str:
+    """Build the common TaQL filter for field + SPW + scan."""
+    query = f"FIELD_ID=={field_id}"
+    if spws:
+        query += f" AND DATA_DESC_ID IN [{','.join(map(str, spws))}]"
+    if scan_ids:
+        query += f" AND SCAN_NUMBER IN [{','.join(map(str, scan_ids))}]"
+    return query
+
+
+def estimate_chunk_rows(ms_file: str, field_id: int, spws: List[int],
+                        time_bounds: np.ndarray,
+                        scan_ids: Optional[List[int]] = None) -> List[int]:
+    """Query row counts per time chunk without reading data."""
     from casacore.tables import table
-    
+
+    counts = []
     with table(ms_file, ack=False) as tb:
-        query = f"FIELD_ID=={field_id} AND TIME>={t_start} AND TIME<{t_end}"
-        if spws:
-            spw_str = ','.join(map(str, spws))
-            query += f" AND DATA_DESC_ID IN [{spw_str}]"
-        
+        base_query = _build_base_query(field_id, spws, scan_ids)
+
+        for i in range(len(time_bounds) - 1):
+            q = f"{base_query} AND TIME>={time_bounds[i]} AND TIME<{time_bounds[i+1]}"
+            with tb.query(q) as sub:
+                counts.append(sub.nrows())
+    return counts
+
+
+def estimate_bytes_per_row(ms_file: str, field_id: int, spws: List[int],
+                           datacolumn: str,
+                           scan_ids: Optional[List[int]] = None) -> int:
+    """Read a single row to estimate memory per row."""
+    from casacore.tables import table
+
+    with table(ms_file, ack=False) as tb:
+        query = _build_base_query(field_id, spws, scan_ids)
+        with tb.query(query, sortlist='', limit=1) as sub:
+            if sub.nrows() == 0:
+                return 0
+            d = sub.getcol(datacolumn)   # (1, nchan, ncorr) complex
+            f = sub.getcol('FLAG')       # (1, nchan, ncorr) bool
+            u = sub.getcol('UVW')        # (1, 3) float64
+            # data + flags + uvw + ddid(int32) + time(float64) + row(int64)
+            return d.nbytes + f.nbytes + u.nbytes + 4 + 8 + 8
+
+
+def read_chunk_batch(ms_file: str, field_id: int, t_start: float,
+                     t_end: float, datacolumn: str,
+                     spws: List[int],
+                     scan_ids: Optional[List[int]] = None) -> Optional[Dict[str, np.ndarray]]:
+    """Read a contiguous time range covering one or more chunks."""
+    from casacore.tables import table
+
+    with table(ms_file, ack=False) as tb:
+        query = _build_base_query(field_id, spws, scan_ids)
+        query += f" AND TIME>={t_start} AND TIME<{t_end}"
+
         with tb.query(query) as sub:
             if sub.nrows() == 0:
                 return None
-            
             return {
                 'data': sub.getcol(datacolumn),
                 'flags': sub.getcol('FLAG'),
                 'uvw': sub.getcol('UVW'),
                 'ddids': sub.getcol('DATA_DESC_ID'),
-                'rows': sub.rownumbers(),
+                'times': sub.getcol('TIME'),
+                'rows': np.array(sub.rownumbers()),
             }
+
+
+def split_batch_into_chunks(batch: Dict[str, np.ndarray],
+                            time_bounds: np.ndarray,
+                            chunk_indices: List[int],
+                            ) -> List[Tuple[int, Optional[Dict[str, np.ndarray]]]]:
+    """Split a pre-read batch into individual time chunks."""
+    times = batch['times']
+    results = []
+    for ci in chunk_indices:
+        mask = (times >= time_bounds[ci]) & (times < time_bounds[ci + 1])
+        if not np.any(mask):
+            results.append((ci, None))
+        else:
+            results.append((ci, {
+                'data': batch['data'][mask],
+                'flags': batch['flags'][mask],
+                'uvw': batch['uvw'][mask],
+                'ddids': batch['ddids'][mask],
+                'rows': batch['rows'][mask],
+            }))
+    return results
 
 
 def process_chunk(args: tuple) -> Dict[str, Any]:
     """
     Process one time chunk - runs in worker process.
-    Returns flags and statistics.
+    Receives pre-read data arrays (no MS I/O here).
     """
-    (ms_file, field_id, t_start, t_end, datacolumn, spws, freqs,
-     corrs, sigma, n_components, roam_around, max_components,
-     min_improvement, max_iter, tolerance, flag_all_corr, 
+    (chunk, field_id, freqs, corrs, sigma,
+     n_components, roam_around, max_components,
+     min_improvement, max_iter, tolerance, flag_all_corr,
      do_plot, chunk_idx) = args
-    
-    chunk = read_chunk(ms_file, field_id, t_start, t_end, datacolumn, spws)
-    
+
     if chunk is None:
         return {'empty': True, 'chunk_idx': chunk_idx, 'flags': [], 'plot_data': []}
     
@@ -213,14 +273,12 @@ def hunt_ms(ms_file: str, options: Dict[str, Any]) -> Dict[str, Any]:
     logger = options.get('logger')
     total_start = time.time()
     
-    # Check C++ availability
-    if is_cpp_available():
-        if logger:
-            logger.info("C++ extension available - using accelerated fitting")
-    else:
-        if logger:
-            logger.warning("✗ C++ extension not available - using Python fallback")
-            logger.warning("  Performance will be reduced. Build with: pip install -e .")
+    # NIMKI requires the C++ extension; core_functions raises ImportError
+    # at import time if it's missing, so by the time we get here the
+    # extension is guaranteed to be loaded. Keep the is_cpp_available()
+    # call only as a sanity log line.
+    if logger and is_cpp_available():
+        logger.info("C++ extension loaded - using accelerated Gabor fitting")
     
     # Get MS info
     if logger:
@@ -261,7 +319,13 @@ def hunt_ms(ms_file: str, options: Dict[str, Any]) -> Dict[str, Any]:
         ncpu = cpu_count()
     
     datacolumn = options.get('datacolumn', 'DATA')
-    
+
+    # Parse scan selection
+    scan_sel = options.get('scan')
+    scan_ids = None
+    if scan_sel:
+        scan_ids = [int(s.strip()) for s in scan_sel.split(',')]
+
     # Get frequencies
     freqs = get_frequencies(ms_file, spw_ids)
     
@@ -290,40 +354,105 @@ def hunt_ms(ms_file: str, options: Dict[str, Any]) -> Dict[str, Any]:
             logger.info(f"Processing Field {fid}: {info['field_names'][fid]}")
             logger.info(f"{'='*60}")
         
-        # Get time range for this field
+        # Build base query for this field (with optional scan filter)
         from casacore.tables import table
+        base_field_query = f"FIELD_ID=={fid}"
+        if scan_ids:
+            base_field_query += f" AND SCAN_NUMBER IN [{','.join(map(str, scan_ids))}]"
+
+        # Get time range for this field
         with table(ms_file, ack=False) as tb:
-            with tb.query(f"FIELD_ID=={fid}") as sub:
+            with tb.query(base_field_query) as sub:
                 if sub.nrows() == 0:
                     if logger:
                         logger.info("  No data for this field")
                     continue
                 times = sub.getcol('TIME')
-        
+
         t_min, t_max = times.min(), times.max()
         chunk_sec = timebin_min * 60
         time_bounds = np.arange(t_min, t_max + chunk_sec, chunk_sec)
         n_chunks = len(time_bounds) - 1
-        
+
         if logger:
             logger.info(f"  Time range: {t_max - t_min:.0f}s in {n_chunks} chunks")
-        
-        # Build task list
-        tasks = [
-            (ms_file, fid, time_bounds[i], time_bounds[i+1],
-             datacolumn, spw_ids, freqs, corr_ids, sigma,
-             n_components, roam_around, max_components,
-             min_improvement, max_iter, tolerance, flag_all_corr,
-             do_plot, i)
-            for i in range(n_chunks)
-        ]
-        
-        # Process chunks
-        if ncpu == 1:
-            results = [process_chunk(t) for t in tasks]
-        else:
-            with Pool(ncpu) as pool:
-                results = pool.map(process_chunk, tasks)
+
+        # Figure out how many chunks we can fit in memory at once
+        bpr = estimate_bytes_per_row(ms_file, fid, spw_ids, datacolumn, scan_ids)
+        chunk_rows = estimate_chunk_rows(ms_file, fid, spw_ids, time_bounds, scan_ids)
+
+        import psutil
+        avail_mem = psutil.virtual_memory().available
+        mem_budget = int(avail_mem * 0.5)  # use at most 50% of free RAM
+
+        # Group consecutive chunks into batches that fit in budget
+        batches = []  # list of (start_chunk_idx, end_chunk_idx)
+        batch_start = 0
+        batch_bytes = 0
+        for ci in range(n_chunks):
+            row_bytes = chunk_rows[ci] * bpr
+            if batch_bytes + row_bytes > mem_budget and ci > batch_start:
+                batches.append((batch_start, ci))
+                batch_start = ci
+                batch_bytes = row_bytes
+            else:
+                batch_bytes += row_bytes
+        batches.append((batch_start, n_chunks))
+
+        if logger:
+            logger.info(f"  {len(batches)} I/O batch(es), ~{bpr} bytes/row, "
+                        f"budget {mem_budget / 1e9:.1f} GB")
+
+        # Process batch by batch: one read, then dispatch to workers
+        results = []
+        for b_start, b_end in batches:
+            batch_data = read_chunk_batch(
+                ms_file, fid,
+                time_bounds[b_start], time_bounds[b_end],
+                datacolumn, spw_ids, scan_ids,
+            )
+
+            chunk_indices = list(range(b_start, b_end))
+            if batch_data is None:
+                for ci in chunk_indices:
+                    results.append({'empty': True, 'chunk_idx': ci,
+                                    'flags': [], 'plot_data': []})
+                continue
+
+            split = split_batch_into_chunks(batch_data, time_bounds,
+                                            chunk_indices)
+            del batch_data
+
+            tasks = [
+                (chunk, fid, freqs, corr_ids, sigma,
+                 n_components, roam_around, max_components,
+                 min_improvement, max_iter, tolerance, flag_all_corr,
+                 do_plot, ci)
+                for ci, chunk in split
+            ]
+            del split
+
+            n_workers = min(ncpu, len(tasks))
+            if n_workers <= 1:
+                batch_results = [process_chunk(t) for t in tasks]
+            else:
+                # Limit OMP threads per worker to avoid oversubscription.
+                # Save/restore the caller's OMP_NUM_THREADS so we don't leak
+                # our internal value into the rest of the process (or any
+                # downstream libs spawned after NIMKI returns).
+                omp_threads = max(1, ncpu // n_workers)
+                _prev_omp = os.environ.get('OMP_NUM_THREADS')
+                os.environ['OMP_NUM_THREADS'] = str(omp_threads)
+                try:
+                    with Pool(n_workers) as pool:
+                        batch_results = pool.map(process_chunk, tasks)
+                finally:
+                    if _prev_omp is None:
+                        os.environ.pop('OMP_NUM_THREADS', None)
+                    else:
+                        os.environ['OMP_NUM_THREADS'] = _prev_omp
+            del tasks
+            results.extend(batch_results)
         
         # Collect results
         field_flags = []

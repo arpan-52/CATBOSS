@@ -328,90 +328,139 @@ GaborFitResult GaborFitter::fit_lm(
     double tol
 ) {
     const size_t n = x.size();
-    const size_t n_params = components.size() * 4;
-    
+    const size_t n_comp = components.size();
+    const size_t n_params = n_comp * 4;
+
     GaborFitResult result;
     result.converged = false;
     result.n_iterations = 0;
-    
+
     // Initial prediction and cost
     std::vector<double> predicted = evaluate(x, components);
     std::vector<double> residuals(n);
+    double cost = 0.0;
     for (size_t i = 0; i < n; ++i) {
         residuals[i] = y[i] - predicted[i];
+        cost += residuals[i] * residuals[i];
     }
-    
-    double cost = 0.0;
-    for (double r : residuals) {
-        cost += r * r;
-    }
-    
+
     // LM parameters
     double lambda = 1e-3;
     const double lambda_up = 10.0;
     const double lambda_down = 0.1;
     const double lambda_min = 1e-10;
     const double lambda_max = 1e10;
-    
-    std::vector<std::vector<double>> J;
+
+    // Flat Jacobian: row-major, n × n_params
+    std::vector<double> J_flat(n * n_params);
     std::vector<std::vector<double>> JtJ(n_params, std::vector<double>(n_params));
     std::vector<double> Jtr(n_params);
     std::vector<double> delta(n_params);
-    
+
     for (int iter = 0; iter < max_iter; ++iter) {
         result.n_iterations = iter + 1;
-        
-        // Compute Jacobian
-        compute_jacobian(x, components, J);
-        
-        // Compute J^T J and J^T r
-        std::fill(Jtr.begin(), Jtr.end(), 0.0);
-        for (auto& row : JtJ) {
-            std::fill(row.begin(), row.end(), 0.0);
-        }
-        
+
+        // Compute Jacobian into flat array — fused with evaluate
+        NAMI_PARALLEL_FOR
         for (size_t i = 0; i < n; ++i) {
+            const double xi = x[i];
+            double* Ji = &J_flat[i * n_params];
+
+            for (size_t c = 0; c < n_comp; ++c) {
+                const auto& comp = components[c];
+                const double x_over_sigma = xi / comp.sigma;
+                const double gaussian = std::exp(-0.5 * x_over_sigma * x_over_sigma);
+                const double angle = comp.omega * xi + comp.phi;
+                const double cos_term = std::cos(angle);
+                const double sin_term = std::sin(angle);
+
+                Ji[4*c + 0] = gaussian * cos_term;
+                Ji[4*c + 1] = comp.amplitude * gaussian * cos_term *
+                               (xi * xi) / (comp.sigma * comp.sigma * comp.sigma);
+                Ji[4*c + 2] = comp.amplitude * gaussian * (-sin_term) * xi;
+                Ji[4*c + 3] = comp.amplitude * gaussian * (-sin_term);
+            }
+        }
+
+        // Compute J^T J and J^T r — accumulate in flat array for OMP reduction
+        std::vector<double> JtJ_flat(n_params * n_params, 0.0);
+        std::fill(Jtr.begin(), Jtr.end(), 0.0);
+
+#ifdef _OPENMP
+        #pragma omp parallel
+        {
+            std::vector<double> local_JtJ(n_params * n_params, 0.0);
+            std::vector<double> local_Jtr(n_params, 0.0);
+
+            #pragma omp for nowait
+            for (size_t i = 0; i < n; ++i) {
+                const double* Ji = &J_flat[i * n_params];
+                const double ri = residuals[i];
+                for (size_t j = 0; j < n_params; ++j) {
+                    local_Jtr[j] += Ji[j] * ri;
+                    for (size_t k = j; k < n_params; ++k) {
+                        local_JtJ[j * n_params + k] += Ji[j] * Ji[k];
+                    }
+                }
+            }
+
+            #pragma omp critical
+            {
+                for (size_t i = 0; i < n_params * n_params; ++i)
+                    JtJ_flat[i] += local_JtJ[i];
+                for (size_t i = 0; i < n_params; ++i)
+                    Jtr[i] += local_Jtr[i];
+            }
+        }
+#else
+        for (size_t i = 0; i < n; ++i) {
+            const double* Ji = &J_flat[i * n_params];
+            const double ri = residuals[i];
             for (size_t j = 0; j < n_params; ++j) {
-                Jtr[j] += J[i][j] * residuals[i];
-                for (size_t k = 0; k < n_params; ++k) {
-                    JtJ[j][k] += J[i][j] * J[i][k];
+                Jtr[j] += Ji[j] * ri;
+                for (size_t k = j; k < n_params; ++k) {
+                    JtJ_flat[j * n_params + k] += Ji[j] * Ji[k];
                 }
             }
         }
-        
+#endif
+
+        // Copy to JtJ and mirror symmetric part
+        for (size_t j = 0; j < n_params; ++j)
+            for (size_t k = j; k < n_params; ++k)
+                JtJ[j][k] = JtJ_flat[j * n_params + k];
+        for (size_t j = 0; j < n_params; ++j)
+            for (size_t k = 0; k < j; ++k)
+                JtJ[j][k] = JtJ[k][j];
+
         // Check gradient convergence
         double grad_norm = 0.0;
-        for (double g : Jtr) {
-            grad_norm += g * g;
-        }
+        for (double g : Jtr) grad_norm += g * g;
         grad_norm = std::sqrt(grad_norm);
-        
+
         if (grad_norm < tol * n) {
             result.converged = true;
             break;
         }
-        
-        // Solve for update
+
+        // Solve for update with LM damping
         bool solved = false;
         int lm_tries = 0;
         const int max_lm_tries = 20;
-        
+
         while (!solved && lm_tries < max_lm_tries) {
             if (!solve_normal_equations(JtJ, Jtr, lambda, delta)) {
                 lambda *= lambda_up;
                 lm_tries++;
                 continue;
             }
-            
+
             // Try update
             std::vector<GaborComponent> new_components = components;
             std::vector<double> params = flatten_params(components);
-            
-            for (size_t i = 0; i < n_params; ++i) {
-                params[i] += delta[i];
-            }
+            for (size_t i = 0; i < n_params; ++i) params[i] += delta[i];
             unflatten_params(params, new_components);
-            
+
             // Compute new cost
             std::vector<double> new_predicted = evaluate(x, new_components);
             double new_cost = 0.0;
@@ -419,44 +468,34 @@ GaborFitResult GaborFitter::fit_lm(
                 double r = y[i] - new_predicted[i];
                 new_cost += r * r;
             }
-            
+
             if (new_cost < cost) {
-                // Accept update
                 components = new_components;
                 predicted = new_predicted;
-                for (size_t i = 0; i < n; ++i) {
+                for (size_t i = 0; i < n; ++i)
                     residuals[i] = y[i] - predicted[i];
-                }
-                
-                // Check cost convergence
+
                 double rel_improvement = (cost - new_cost) / (cost + 1e-10);
                 cost = new_cost;
-                
                 lambda = std::max(lambda * lambda_down, lambda_min);
                 solved = true;
-                
-                if (rel_improvement < tol) {
-                    result.converged = true;
-                }
+
+                if (rel_improvement < tol) result.converged = true;
             } else {
-                // Reject, increase damping
                 lambda = std::min(lambda * lambda_up, lambda_max);
                 lm_tries++;
             }
         }
-        
-        if (!solved || result.converged) {
-            break;
-        }
+
+        if (!solved || result.converged) break;
     }
-    
-    // Final results
+
     result.components = components;
     result.predicted = predicted;
     result.residuals = residuals;
     result.rms_residual = compute_rms(residuals);
     result.mad_sigma = compute_mad_sigma(residuals);
-    
+
     return result;
 }
 
@@ -469,48 +508,86 @@ GaborFitResult GaborFitter::fit(
     double tol,
     int n_restarts
 ) {
-    if (x.size() != y.size()) {
+    const size_t n = x.size();
+
+    if (n != y.size()) {
         throw std::runtime_error("x and y must have same size");
     }
-    if (x.size() < static_cast<size_t>(n_components * 4)) {
+    if (n < static_cast<size_t>(n_components * 4)) {
         throw std::runtime_error("Not enough data points for requested components");
     }
     if (n_components < 1) {
         throw std::runtime_error("Need at least 1 component");
     }
-    
+
     // Check for NaN/Inf
-    for (size_t i = 0; i < x.size(); ++i) {
+    for (size_t i = 0; i < n; ++i) {
         if (!std::isfinite(x[i]) || !std::isfinite(y[i])) {
             throw std::runtime_error("Data contains NaN or Inf");
         }
     }
-    
+
+    // === Subsample for fitting ===
+    // 20 parameters don't need millions of points. Fit on a subsample,
+    // then evaluate on all points for the final residuals.
+    const size_t max_fit_points = 50000;
+    std::vector<double> x_fit, y_fit;
+
+    if (n > max_fit_points) {
+        // Stratified subsample: sort by x, pick evenly spaced indices
+        // to preserve the full UV-distance range
+        std::vector<size_t> indices(n);
+        std::iota(indices.begin(), indices.end(), 0);
+        std::sort(indices.begin(), indices.end(),
+                  [&x](size_t a, size_t b) { return x[a] < x[b]; });
+
+        x_fit.resize(max_fit_points);
+        y_fit.resize(max_fit_points);
+        const double step = static_cast<double>(n) / max_fit_points;
+        for (size_t i = 0; i < max_fit_points; ++i) {
+            size_t idx = indices[static_cast<size_t>(i * step)];
+            x_fit[i] = x[idx];
+            y_fit[i] = y[idx];
+        }
+    } else {
+        x_fit = x;
+        y_fit = y;
+    }
+
+    // === Fit on subsample ===
     GaborFitResult best_result;
     best_result.rms_residual = std::numeric_limits<double>::max();
     best_result.converged = false;
-    
-    // Try multiple restarts
+
     for (int restart = 0; restart < n_restarts; ++restart) {
-        // Initialize components (first try deterministic, rest randomized)
         std::vector<GaborComponent> components = initialize_components(
-            x, y, n_components, restart > 0
+            x_fit, y_fit, n_components, restart > 0
         );
-        
-        // Run LM optimization
-        GaborFitResult result = fit_lm(x, y, components, max_iter, tol);
-        
-        // Keep best
+
+        GaborFitResult result = fit_lm(x_fit, y_fit, components, max_iter, tol);
+
         if (result.rms_residual < best_result.rms_residual) {
             best_result = result;
         }
-        
-        // Early exit if converged well
+
         if (result.converged && result.rms_residual < tol * 100) {
             break;
         }
     }
-    
+
+    // === Evaluate on ALL points for flagging ===
+    if (n > max_fit_points) {
+        best_result.predicted = evaluate(x, best_result.components);
+        best_result.residuals.resize(n);
+        double sum_sq = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            best_result.residuals[i] = y[i] - best_result.predicted[i];
+            sum_sq += best_result.residuals[i] * best_result.residuals[i];
+        }
+        best_result.rms_residual = std::sqrt(sum_sq / n);
+        best_result.mad_sigma = compute_mad_sigma(best_result.residuals);
+    }
+
     return best_result;
 }
 

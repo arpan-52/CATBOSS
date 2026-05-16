@@ -56,6 +56,7 @@ htmlcov/
 pooh_plots/
 nimki_plots/
 *_plots/
+*_plots_*/
 *.png
 *.pdf
 *.svg
@@ -76,6 +77,9 @@ logs/
 # ── Numba cache ───────────────────────────────────────────────────────────────────
 __numba_cache__/
 numba_cache/
+
+# ── Local analysis (not part of the package) ─────────────────────────────────────
+paper_analysis/
 
 # ── Docs build ────────────────────────────────────────────────────────────────────
 docs/_build/
