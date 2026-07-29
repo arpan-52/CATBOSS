@@ -81,6 +81,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "catboss.nimki.cpp" = ["*.cpp", "*.h"]
+"catboss.nimki" = ["*.so"]
 
 [tool.black]
 line-length = 100

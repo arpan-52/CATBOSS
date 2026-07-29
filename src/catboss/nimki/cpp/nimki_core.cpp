@@ -80,7 +80,7 @@ py::dict collect_data_py(
 }
 
 
-PYBIND11_MODULE(_nami_core, m) {
+PYBIND11_MODULE(_nimki_core, m) {
     m.doc() = R"doc(
         NAMI C++ Core - Fast RFI flagging for radio astronomy
         

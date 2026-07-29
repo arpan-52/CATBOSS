@@ -25,7 +25,7 @@ cpp_dir = os.path.join(here, "cpp")
 
 # Source files
 sources = [
-    os.path.join(cpp_dir, "nami_core.cpp"),
+    os.path.join(cpp_dir, "nimki_core.cpp"),
     os.path.join(cpp_dir, "gabor_fit.cpp"),
     os.path.join(cpp_dir, "uv_calc.cpp"),
     os.path.join(cpp_dir, "data_collection.cpp"),
@@ -37,13 +37,23 @@ for src in sources:
     if not os.path.exists(src):
         print(f"Warning: Source file not found: {src}")
 
+def _compile_args():
+    """-march is opt-in; see setup.py. Defaulting to native crashes with SIGILL
+    on older CPUs, which matters for container images."""
+    args = ["-O3", "-ffast-math", "-fopenmp"]
+    march = os.environ.get("CATBOSS_MARCH", "").strip()
+    if march:
+        args.append("-march=" + march)
+    return args
+
+
 # Extension module
 ext_modules = [
     Pybind11Extension(
-        "_nami_core",
+        "_nimki_core",
         sources=sources,
         include_dirs=[cpp_dir],
-        extra_compile_args=["-O3", "-ffast-math", "-march=native", "-fopenmp"],
+        extra_compile_args=_compile_args(),
         extra_link_args=["-fopenmp"],
         language="c++",
         cxx_std=17,
@@ -51,7 +61,7 @@ ext_modules = [
 ]
 
 setup(
-    name="_nami_core",
+    name="_nimki_core",
     version="1.0.0",
     author="Arpan Pal",
     author_email="arpanpal@ncra.tifr.res.in",

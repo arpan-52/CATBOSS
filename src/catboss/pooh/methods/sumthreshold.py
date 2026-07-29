@@ -80,7 +80,12 @@ def _sum_threshold_cpu_batch(
                             count += 1
                     
                     # Need at least 30% unflagged
-                    min_unflagged = max(1, int(M * 0.3))
+                    # numba >= 0.66 dropped 2-arg max/min in CUDA device code
+                    # (TypeError: Signature mismatch: 2 argument types given,
+                    #  but function takes 1 arguments) - clamp explicitly.
+                    min_unflagged = int(M * 0.3)
+                    if min_unflagged < 1:
+                        min_unflagged = 1
                     
                     if count >= min_unflagged:
                         avg_val = window_sum / count
@@ -103,7 +108,12 @@ def _sum_threshold_cpu_batch(
                             window_sum += amp[bl, t + k, f]
                             count += 1
                     
-                    min_unflagged = max(1, int(M * 0.3))
+                    # numba >= 0.66 dropped 2-arg max/min in CUDA device code
+                    # (TypeError: Signature mismatch: 2 argument types given,
+                    #  but function takes 1 arguments) - clamp explicitly.
+                    min_unflagged = int(M * 0.3)
+                    if min_unflagged < 1:
+                        min_unflagged = 1
                     
                     if count >= min_unflagged:
                         avg_val = window_sum / count
@@ -156,7 +166,12 @@ if is_gpu_available():
                         window_sum += amp[bl, t, f + k]
                         count += 1
 
-                min_unflagged = max(1, int(M * 0.3))
+                # numba >= 0.66 dropped 2-arg max/min in CUDA device code
+                # (TypeError: Signature mismatch: 2 argument types given,
+                #  but function takes 1 arguments) - clamp explicitly.
+                min_unflagged = int(M * 0.3)
+                if min_unflagged < 1:
+                    min_unflagged = 1
 
                 if count >= min_unflagged:
                     avg_val = window_sum / count
@@ -187,7 +202,12 @@ if is_gpu_available():
                         window_sum += amp[bl, t + k, f]
                         count += 1
 
-                min_unflagged = max(1, int(M * 0.3))
+                # numba >= 0.66 dropped 2-arg max/min in CUDA device code
+                # (TypeError: Signature mismatch: 2 argument types given,
+                #  but function takes 1 arguments) - clamp explicitly.
+                min_unflagged = int(M * 0.3)
+                if min_unflagged < 1:
+                    min_unflagged = 1
 
                 if count >= min_unflagged:
                     avg_val = window_sum / count
