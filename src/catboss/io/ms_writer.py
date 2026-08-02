@@ -170,6 +170,111 @@ def write_flags_batched(
     return n_written
 
 
+# Rows per getcol/putcol pass in the batched flag writer. 50k rows of a
+# 230-chan x 4-corr MS is ~46 MB, so the peak stays small regardless of MS size.
+FLAG_WRITE_CHUNK_ROWS = 50000
+
+
+def _write_field_flags_batched(
+    ms_file: str,
+    field_id: int,
+    baseline_flags: Dict[Tuple[int, int], np.ndarray],
+    spw: Optional[int],
+    logger
+) -> int:
+    """
+    Single-pass flag write for a whole field.
+
+    One TaQL selection over the field, then one sequential read and one
+    sequential write of FLAG, instead of a full selection + read + write per
+    baseline. Row ordering is identical to the per-baseline path: within the
+    field selection the rows of any one baseline appear in the same relative
+    (table) order as they would in a baseline-restricted selection, and the
+    stable argsort below preserves it. That is the same order
+    read_baseline_data used to build the arrays being written back.
+    """
+    from casacore.tables import table
+
+    where = f"FIELD_ID=={int(field_id)}"
+    if spw is not None:
+        where += f" AND DATA_DESC_ID=={int(spw)}"
+
+    tab = table(ms_file, readonly=False, ack=False)
+    try:
+        sel = tab.query(where)
+        try:
+            n_rows = sel.nrows()
+            if n_rows == 0:
+                return 0
+
+            ant1 = sel.getcol("ANTENNA1")
+            ant2 = sel.getcol("ANTENNA2")
+
+            # Group rows by baseline, preserving table order inside each group.
+            key = (ant1.astype(np.int64) << 32) | ant2.astype(np.int64)
+            order = np.argsort(key, kind="stable")
+            skey = key[order]
+            starts = np.flatnonzero(
+                np.concatenate(([True], skey[1:] != skey[:-1]))
+            )
+            ends = np.concatenate((starts[1:], [len(skey)]))
+
+            row_index = {}
+            for s, e in zip(starts, ends):
+                k = int(skey[s])
+                row_index[(k >> 32, k & 0xFFFFFFFF)] = order[s:e]
+
+            sample = sel.getcol("FLAG", 0, 1)
+            n_chan, n_corr = int(sample.shape[1]), int(sample.shape[2])
+
+            # Scatter the new flags into a field-shaped array, then OR it into
+            # FLAG chunk by chunk. Only the overlapping region of each baseline
+            # is touched, matching the per-baseline shape-mismatch behaviour.
+            new_all = np.zeros((n_rows, n_chan, n_corr), dtype=bool)
+            n_written = 0
+
+            for bl, new_flags in baseline_flags.items():
+                rows = row_index.get((int(bl[0]), int(bl[1])))
+                if rows is None or len(rows) == 0:
+                    continue
+
+                arr = np.asarray(new_flags)
+                if arr.ndim == 2:
+                    # 2D flags -> broadcast across all correlations
+                    arr = np.broadcast_to(arr[:, :, None],
+                                          (arr.shape[0], arr.shape[1], n_corr))
+
+                nt = min(len(rows), arr.shape[0])
+                nf = min(n_chan, arr.shape[1])
+                nc = min(n_corr, arr.shape[2])
+                if nt == 0:
+                    continue
+
+                if nf == n_chan and nc == n_corr:
+                    new_all[rows[:nt]] = arr[:nt].astype(bool, copy=False)
+                else:
+                    new_all[rows[:nt], :nf, :nc] = \
+                        arr[:nt, :nf, :nc].astype(bool, copy=False)
+                n_written += 1
+
+            for start in range(0, n_rows, FLAG_WRITE_CHUNK_ROWS):
+                n = min(FLAG_WRITE_CHUNK_ROWS, n_rows - start)
+                flags = sel.getcol("FLAG", start, n)
+                np.logical_or(flags, new_all[start:start + n], out=flags)
+                sel.putcol("FLAG", flags, start, n)
+
+            sel.flush()
+        finally:
+            sel.close()
+    finally:
+        tab.close()
+
+    if logger:
+        logger.info(f"  Wrote flags for {n_written}/{len(baseline_flags)} baselines")
+
+    return n_written
+
+
 def write_field_flags(
     ms_file: str,
     field_id: int,
@@ -179,26 +284,46 @@ def write_field_flags(
 ) -> int:
     """
     Write flags for an entire field.
-    
+
+    Does one pass over the field's rows. The previous implementation called
+    apply_flags_to_ms once per baseline, and each of those ran a full
+    xds_from_ms + TaQL selection + compute + write-back over the whole MS -
+    1711 scans of the table for a 59-antenna array, which made writing ~25% of
+    total flagging time. Falls back to that path if the batched write fails.
+
     Args:
         ms_file: Path to MS file
         field_id: Field ID
         baseline_flags: Dict mapping baseline to flag array
         spw: Optional SPW filter
         logger: Optional logger
-        
+
     Returns:
         Number of baselines written
     """
+    if not baseline_flags:
+        return 0
+
+    try:
+        return _write_field_flags_batched(
+            ms_file, field_id, baseline_flags, spw, logger
+        )
+    except Exception as e:
+        if logger:
+            logger.warning(
+                f"  Batched flag write failed ({e}); "
+                f"falling back to per-baseline writes"
+            )
+
     n_written = 0
-    
+
     for bl, new_flags in baseline_flags.items():
         if apply_flags_to_ms(ms_file, bl, field_id, new_flags, spw, logger):
             n_written += 1
-    
+
     if logger:
         logger.info(f"  Wrote flags for {n_written}/{len(baseline_flags)} baselines")
-    
+
     return n_written
 
 
